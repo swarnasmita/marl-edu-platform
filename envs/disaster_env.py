@@ -8,8 +8,9 @@ human or an RL agent during training); robot_1 and robot_2 are the RL agents.
 
 Task: 10 victims. 6 are known at the start; 4 more are reported at random
 times during the operation (found by search teams), so plans have to change
-mid-episode. Critical victims must reach triage within 25 s of being reported, moderate
-within 45 s; robots slow down when carrying someone.
+mid-episode. Critical victims must be reached (picked up) within 25 s of being reported,
+moderate within 45 s; once on a stretcher their timer stops. Robots slow down
+when carrying someone.
 
 RL interface: 9 discrete actions per robot (stay / 8 directions). Observation
 per robot (90 numbers): own state, triage direction, 6 features per victim,
@@ -87,7 +88,8 @@ TURN_RATE = 0.25           # how quickly a robot's body turns toward its directi
 class DisasterResponseEnv(ParallelEnv):
     metadata = {"name": "disaster_response_v2", "render_modes": ["rgb_array"]}
 
-    def __init__(self, render_mode=None, width=1280, height=800, camera="overview"):
+    def __init__(self, render_mode=None, width=1280, height=800, camera="overview", observe=True):
+        self.observe = observe          # False skips building observations (hierarchical training is faster)
         self.model = mujoco.MjModel.from_xml_path(XML_PATH)
         self.data = mujoco.MjData(self.model)
         self.render_mode = render_mode
@@ -159,6 +161,7 @@ class DisasterResponseEnv(ParallelEnv):
         return self._act_space
 
     def reset(self, seed=None, options=None):
+        self.episode_seed = seed
         if seed is not None:
             self.np_random = np.random.default_rng(seed)
         mujoco.mj_resetData(self.model, self.data)
@@ -181,6 +184,9 @@ class DisasterResponseEnv(ParallelEnv):
         self.time_left = np.array([TIME_LIMIT[s] for s in self.severity], dtype=float)
         self.carrier = np.full(N_VICTIMS, -1)
         self.carrying = np.full(N_ROBOTS, -1)
+        self.pickup_time = np.full(N_VICTIMS, -1)     # step at which each victim was picked up (for metrics)
+        self.picked_by = np.full(N_VICTIMS, -1)
+        self.rescued_by = np.full(N_VICTIMS, -1)
         self.heading = np.zeros(N_ROBOTS)        # 0 = facing north (+y)
         self.rescued_count = 0
         self.lost_count = 0
@@ -190,7 +196,7 @@ class DisasterResponseEnv(ParallelEnv):
         self._sync_robots()
         self._sync_victims()
         mujoco.mj_forward(self.model, self.data)
-        obs = {a: self._obs(i) for i, a in enumerate(self.agents)}
+        obs = {a: (self._obs(i) if self.observe else None) for i, a in enumerate(self.agents)}
         return obs, {a: {"victim_spots": list(self.victim_spot)} for a in self.agents}
 
     def step(self, actions):
@@ -215,12 +221,14 @@ class DisasterResponseEnv(ParallelEnv):
                     if d[k] < PICKUP_RADIUS:
                         j = waiting[k]
                         self.status[j], self.carrying[i], self.carrier[j] = CARRIED, j, i
+                        self.pickup_time[j], self.picked_by[j] = self.t, i
                         reward += R_PICKUP
                         events.append(("pickup", i, j))
             elif np.all(pos[i] > SAFE_MIN) and np.all(pos[i] < SAFE_MAX):
                 # deliver the carried victim to the triage area: laid on the next free cot
                 j = self.carrying[i]
                 self.status[j], self.carrying[i], self.carrier[j] = RESCUED, -1, -1
+                self.rescued_by[j] = i
                 self.victim_pos[j] = self.rescue_slots[self.rescued_count % len(self.rescue_slots)][:2]
                 self.victim_yaw[j] = 0.0
                 self.rescued_count += 1
@@ -253,7 +261,7 @@ class DisasterResponseEnv(ParallelEnv):
         done = bool(np.all((self.status == RESCUED) | (self.status == LOST)))
         truncated = self.t >= MAX_STEPS and not done
         agents = self.agents
-        obs = {a: self._obs(self.possible_agents.index(a)) for a in agents}
+        obs = {a: (self._obs(self.possible_agents.index(a)) if self.observe else None) for a in agents}
         rewards = {a: reward for a in agents}
         terminations = {a: done for a in agents}
         truncations = {a: truncated for a in agents}

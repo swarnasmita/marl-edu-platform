@@ -46,9 +46,10 @@ class GridPlanner:
         self._fields = {}
 
     def cell(self, p):
-        i = int(np.clip((p[0] - self.lo) // self.res, 0, self.n - 1))
-        j = int(np.clip((p[1] - self.lo) // self.res, 0, self.n - 1))
-        return i, j
+        top = self.n - 1
+        i = int((float(p[0]) - self.lo) // self.res)
+        j = int((float(p[1]) - self.lo) // self.res)
+        return min(max(i, 0), top), min(max(j, 0), top)
 
     def point(self, c):
         return np.array([self.centres[c[0]], self.centres[c[1]]])
@@ -63,8 +64,12 @@ class GridPlanner:
 
     def field(self, goal):
         """Distance-to-goal map (Dijkstra on the 8-connected grid), cached per goal cell."""
-        g = self.nearest_free(self.cell(goal))
+        key = self.cell(goal)
+        if key in self._fields:
+            return self._fields[key]
+        g = self.nearest_free(key)
         if g in self._fields:
+            self._fields[key] = self._fields[g]
             return self._fields[g]
         dist = np.full((self.n, self.n), np.inf)
         dist[g] = 0.0
@@ -84,7 +89,7 @@ class GridPlanner:
                         dist[a, b] = nd
                         heapq.heappush(heap, (nd, (a, b)))
         dist *= self.res
-        self._fields[g] = dist
+        self._fields[g] = self._fields[key] = dist
         return dist
 
     def path_length(self, p, goal):

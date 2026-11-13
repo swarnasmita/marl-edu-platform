@@ -2,15 +2,23 @@
 
 Arrow keys move your robot (purple). Drive up to a victim to pick them up, then
 bring them to the medical station's triage area (red-bordered tarp with cots).
-The blue robots use the greedy path-planning policy for now; trained MARL agents
-will replace it later.
+The blue robots decide which victim to go for with the trained MAPPO policy
+(agents/checkpoints/mappo_disaster.pt) if it exists, otherwise with the greedy
+rule; press M to switch. Dashed lines show where each blue robot is heading.
 
 Victims are highlighted with circles in their triage colour, labelled with
 severity and time left; robots are labelled YOU / R1 / R2.
 
+The panel on the right is the learner model: from the choices you make while
+playing, it estimates how well you understand five RL ideas (Bayesian
+Knowledge Tracing) and explains each decision it judged. It persists across
+restarts (R); press K to start a fresh learner profile.
+
 Mouse (free camera): left-drag = rotate, right-drag = pan, wheel = zoom.
 Keys: arrows = move, C = next camera, F = free camera follows your robot,
-      H = hide/show highlights, L = show your robot's distance sensors, R = restart.
+      H = hide/show highlights, L = show your robot's distance sensors,
+      M = switch blue robots between MAPPO and the greedy rule, R = restart,
+      K = reset your learner profile.
 Run from the project root:  python envs/view_disaster.py
 """
 import os
@@ -22,19 +30,89 @@ sys.path.insert(0, ROOT)
 import numpy as np
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
-from PySide6.QtWidgets import QApplication, QLabel, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QApplication, QHBoxLayout, QLabel, QVBoxLayout, QWidget
 
-from agents.heuristic_policy import GreedyPolicy, direction_to_action
+from agents.heuristic_policy import direction_to_action
+from agents.hrl import WAIT, HierarchicalController, MappoChooser, greedy_choice
+from learner.learner_model import CONCEPTS, LearnerModel
 from envs.disaster_env import (CAMERAS, CARRIED, DT, LEARNER, LOST, MAX_STEPS, N_ROBOTS, N_VICTIMS,
                                R_RESCUE, RAY_ANGLES, RAY_RANGE, SAFE_CENTER, SEVERITY_COLOURS,
                                SEVERITY_NAMES, UNREPORTED, URGENT_STEPS, WAITING, DisasterResponseEnv)
 
-W, H = 1152, 720
+W, H = 1024, 640
+PANEL_W = 300
 STEP_MS = int(1000 * DT)          # real-time playback
 CAMERA_LABELS = {"free": "Free (mouse)", "overview": "Overview", "isometric": "Isometric",
                  "follow": "Follow your robot", "triage": "Medical station",
                  "ruins": "Collapsed houses (NW)", "collapse": "Collapse site (NE/E)"}
+CHECKPOINT = os.path.join(ROOT, "agents", "checkpoints", "mappo_disaster.pt")
 ROBOT_LABELS = {0: ("YOU", QColor(170, 90, 240)), 1: ("R1", QColor(40, 130, 245)), 2: ("R2", QColor(40, 130, 245))}
+
+
+class LearnerPanel(QWidget):
+    """Draws the learner model's current estimate: one bar per concept, decision quality, last feedback."""
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedSize(PANEL_W, H)
+        self.summary, self.feedback = None, None
+
+    def update_state(self, summary, feedback):
+        self.summary, self.feedback = summary, feedback
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.fillRect(self.rect(), QColor(28, 30, 36))
+        p.setPen(QColor(240, 240, 240))
+        p.setFont(QFont("Segoe UI", 12, QFont.Bold))
+        p.drawText(QRectF(16, 12, PANEL_W - 32, 24), Qt.AlignLeft, "Your understanding")
+        p.setFont(QFont("Segoe UI", 8))
+        p.setPen(QColor(160, 165, 175))
+        p.drawText(QRectF(16, 36, PANEL_W - 32, 30), Qt.TextWordWrap,
+                   "Estimated from your choices in the scene (Bayesian Knowledge Tracing).")
+        if self.summary is None:
+            return
+        y = 74
+        for c, label in CONCEPTS.items():
+            m = self.summary["mastery"][c]
+            good, n = self.summary["evidence"][c]
+            p.setPen(QColor(225, 225, 230))
+            p.setFont(QFont("Segoe UI", 9))
+            p.drawText(QRectF(16, y, PANEL_W - 32, 18), Qt.AlignLeft, label)
+            y += 20
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(55, 58, 66))
+            p.drawRoundedRect(QRectF(16, y, PANEL_W - 90, 12), 6, 6)
+            col = QColor(220, 70, 60) if m < 0.4 else (QColor(235, 180, 50) if m < 0.75 else QColor(70, 190, 100))
+            if n == 0:
+                col = QColor(95, 98, 108)          # not tested yet
+            p.setBrush(col)
+            p.drawRoundedRect(QRectF(16, y, max(12.0, (PANEL_W - 90) * m), 12), 6, 6)
+            p.setPen(QColor(200, 200, 205))
+            p.setFont(QFont("Segoe UI", 8))
+            p.drawText(QRectF(PANEL_W - 70, y - 3, 60, 18), Qt.AlignRight,
+                       f"{m:.0%}  ({good}/{n})" if n else "not tested")
+            y += 26
+        q = self.summary["quality"]
+        p.setPen(QColor(225, 225, 230))
+        p.setFont(QFont("Segoe UI", 9, QFont.Bold))
+        p.drawText(QRectF(16, y + 4, PANEL_W - 32, 18), Qt.AlignLeft,
+                   f"Agreement with the trained agent: {q:.0%}" if q is not None else "Agreement with the trained agent: -")
+        p.setFont(QFont("Segoe UI", 8))
+        p.setPen(QColor(160, 165, 175))
+        p.drawText(QRectF(16, y + 24, PANEL_W - 32, 18), Qt.AlignLeft,
+                   f"Decisions assessed: {self.summary['decisions']}   (K = new profile)")
+        y += 52
+        p.setPen(QColor(240, 240, 240))
+        p.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        p.drawText(QRectF(16, y, PANEL_W - 32, 20), Qt.AlignLeft, "Your last decision")
+        p.setFont(QFont("Segoe UI", 9))
+        p.setPen(QColor(215, 215, 220))
+        text = self.feedback or "Pick up a victim: your choice will be explained here."
+        p.drawText(QRectF(16, y + 24, PANEL_W - 32, H - y - 34), Qt.TextWordWrap, text)
+        p.end()
 
 
 def qcolour(rgb, alpha=255):
@@ -45,7 +123,12 @@ class Viewer(QWidget):
     def __init__(self):
         super().__init__()
         self.env = DisasterResponseEnv(render_mode="rgb_array", width=W, height=H, camera="free")
-        self.policy = GreedyPolicy(self.env)
+        self.ctrl = HierarchicalController(self.env)
+        self.mappo = MappoChooser(self.env, self.ctrl, CHECKPOINT) if os.path.exists(CHECKPOINT) else None
+        self.brain = "mappo" if self.mappo else "greedy"
+        self.learner = LearnerModel(self.env, self.ctrl, expert=self.mappo)
+        self.panel = LearnerPanel()
+        self.feedback = None
         self.pressed = set()
         self.highlights = True
         self.show_rays = False
@@ -59,7 +142,10 @@ class Viewer(QWidget):
         self.status = QLabel()
         self.status.setStyleSheet("font-size: 14px; padding: 6px;")
         layout = QVBoxLayout(self)
-        layout.addWidget(self.image)
+        row = QHBoxLayout()
+        row.addWidget(self.image)
+        row.addWidget(self.panel)
+        layout.addLayout(row)
         layout.addWidget(self.status)
         self.setWindowTitle("Disaster Response - urban earthquake rescue")
         self.setFocusPolicy(Qt.StrongFocus)
@@ -72,7 +158,8 @@ class Viewer(QWidget):
     def restart(self):
         self.reported_at = {}
         self.env.reset()
-        self.policy.reset()
+        self.ctrl.reset()
+        self.learner.new_episode()
         self.draw()
 
     # --- keyboard -------------------------------------------------------------------
@@ -94,6 +181,19 @@ class Viewer(QWidget):
             self.draw()
         elif k == Qt.Key_L:
             self.show_rays = not self.show_rays
+            self.draw()
+        elif k == Qt.Key_K:
+            self.learner.reset()
+            self.feedback = None
+            self.message = "Started a fresh learner profile."
+            self.draw()
+        elif k == Qt.Key_M:
+            if self.mappo is None:
+                self.message = "No trained MAPPO model found (agents/checkpoints/mappo_disaster.pt)."
+            else:
+                self.brain = "greedy" if self.brain == "mappo" else "mappo"
+                self.ctrl.replan = [True] * N_ROBOTS
+                self.message = f"Blue robots now use: {self.brain_name()}."
             self.draw()
         elif not e.isAutoRepeat():
             self.pressed.add(k)
@@ -140,13 +240,24 @@ class Viewer(QWidget):
         self.draw()
 
     # --- main loop ------------------------------------------------------------------
+    def brain_name(self):
+        return "MAPPO (trained)" if self.brain == "mappo" else "greedy rule"
+
+    def choose(self, i):
+        if self.brain == "mappo" and self.mappo is not None:
+            return self.mappo(i)
+        return greedy_choice(self.env, self.ctrl, i)
+
     def tick(self):
         if not self.env.agents:          # episode over: wait for R
             return
-        actions = {LEARNER: self.learner_action()}
-        for i, a in self.policy.act(range(1, N_ROBOTS)).items():
-            actions[f"robot_{i}"] = a
+        actions = self.ctrl.actions(self.choose, teammate=None, learner_action=self.learner_action())
         _, _, _, _, infos = self.env.step(actions)
+        self.ctrl.notify(infos[LEARNER]["events"])
+        n_before = len(self.learner.decisions)
+        self.learner.observe(infos[LEARNER]["events"])
+        if len(self.learner.decisions) > n_before:
+            self.feedback = self.learner.last_feedback()
 
         for kind, robot, victim in infos[LEARNER]["events"]:
             self.message = self.describe(kind, robot, victim)
@@ -178,6 +289,7 @@ class Viewer(QWidget):
         if self.highlights:
             self.draw_overlay(img)
         self.image.setPixmap(QPixmap.fromImage(img))
+        self.panel.update_state(self.learner.summary(), self.feedback)
         env = self.env
         time_left = (MAX_STEPS - env.t) * DT
         carrying = "carrying a victim" if env.carrying[0] >= 0 else "empty"
@@ -185,7 +297,7 @@ class Viewer(QWidget):
         self.status.setText(
             f"Time left: {time_left:5.1f}s   |   Team score: {env.score:6.1f}   |   Reported: {known}/{N_VICTIMS}   "
             f"Rescued: {env.rescued_count}   Lost: {env.lost_count}   |   You: {carrying}   |   "
-            f"Camera: {CAMERA_LABELS[env.camera]}\n"
+            f"Camera: {CAMERA_LABELS[env.camera]}   |   Blue robots: {self.brain_name()} (M)\n"
             f"{self.message}\n"
             f"Arrows move  ·  C camera  ·  F follow  ·  mouse rotate/pan/zoom  ·  H highlights  ·  "
             f"L sensors  ·  R restart"
@@ -277,8 +389,22 @@ class Viewer(QWidget):
                 text = "◀ " + text if cx < W / 2 else text + " ▶"
             self.label(p, cx, cy - r, text, col)
 
-        # robots
+        # where each blue robot is heading (its current decision)
         pos = env.robot_positions()
+        for i in (1, 2):
+            tgt = self.ctrl.target[i]
+            if env.carrying[i] >= 0:
+                goal = SAFE_CENTER
+            elif tgt is not None and env.status[tgt] == WAITING:
+                goal = env.victim_pos[tgt]
+            else:
+                continue
+            (ax, ay), (bx, by) = env.project([[*pos[i], 0.4], [*goal, 0.15]])
+            if np.isfinite(ax) and np.isfinite(bx):
+                p.setPen(QPen(QColor(40, 130, 245, 200), 2, Qt.DashLine))
+                p.drawLine(QPointF(ax, ay), QPointF(bx, by))
+
+        # robots
         pts = env.project([[*pos[i], 1.3] for i in range(N_ROBOTS)])
         for i in range(N_ROBOTS):
             x, y = pts[i]
@@ -287,6 +413,8 @@ class Viewer(QWidget):
             name, col = ROBOT_LABELS[i]
             if env.carrying[i] >= 0:
                 name += f" + {SEVERITY_NAMES[env.severity[env.carrying[i]]]}"
+            elif i > 0 and self.ctrl.target[i] is None and env.status[env.status == WAITING].size:
+                name += " (waiting)"
             self.label(p, x, y, name, col)
         p.end()
 
