@@ -1,4 +1,10 @@
-"""Train the blue robots (robot_1, robot_2) with hierarchical MAPPO.
+"""Train the blue robots (robot_1, robot_2) with hierarchical MAPPO (or the IPPO / MAA2C baselines).
+
+--algo mappo   shared actor + centralised critic + PPO clipped update (the main method)
+--algo ippo    same, but the critic only sees the robot's own view (decentralised critic)
+--algo maa2c   centralised critic, plain advantage actor-critic update: no clipping, one pass per batch
+Everything else (features, network size, reward, episodes, teammates, validation) is identical.
+QMIX (value-based) is in agents/train_qmix.py.
 
 - Actor (shared by both robots, decentralised): sees only its own robot's view
   (actor_features) and picks a victim to go for, or "wait".
@@ -50,19 +56,24 @@ def _init_worker():
     ctrl = HierarchicalController(env)
     for p in env.spawn_points:                   # pre-compute route maps to every victim location
         ctrl.planner.field(p[:2])
+    from agents.hrl import ACTOR_GLOBAL_DIM, ACTOR_VICTIM_DIM
     Actor, Critic = build_networks()
-    _W.update(env=env, ctrl=ctrl, actor=Actor(), critic=Critic(), torch=torch)
+    _W.update(env=env, ctrl=ctrl, actor=Actor(), critic=Critic(), torch=torch,
+              local_critic=Critic(vdim=ACTOR_VICTIM_DIM, gdim=ACTOR_GLOBAL_DIM))
 
 
 def _episode(args):
     """Run one episode. mode = 'train' (sample actions, record transitions) or a rule/eval mode."""
-    actor_state, critic_state, seed, teammate, mode = args
+    actor_state, critic_state, seed, teammate, mode, *rest = args
+    algo = rest[0] if rest else "mappo"
     import agents.hrl as H
     from envs.disaster_env import N_VICTIMS, RESCUED
     torch, env, ctrl = _W["torch"], _W["env"], _W["ctrl"]
-    actor, critic = _W["actor"], _W["critic"]
+    actor = _W["actor"]
+    critic = _W["local_critic"] if algo == "ippo" else _W["critic"]
     if actor_state is not None:
         actor.load_state_dict(actor_state)
+    if mode == "train" and critic_state is not None:     # the critic is only needed while training
         critic.load_state_dict(critic_state)
     rng = np.random.default_rng(seed)
     env.reset(seed=seed)
@@ -86,7 +97,7 @@ def _episode(args):
             return int(torch.argmax(logits))
         dist = torch.distributions.Categorical(logits=logits)
         a = int(dist.sample())
-        Vc, Gc = H.critic_features(env, ctrl, i, teammate)
+        Vc, Gc = (V, G) if algo == "ippo" else H.critic_features(env, ctrl, i, teammate)
         with torch.no_grad():
             value = float(critic(torch.from_numpy(Vc), torch.from_numpy(Gc)))
         if pending[i] is not None:
@@ -174,8 +185,11 @@ def ppo_update(actor, critic, opt, batch, args, ent_coef):
         for s in range(0, n, args.minibatch):
             idx = perm[s:s + args.minibatch]
             dist = torch.distributions.Categorical(logits=actor(V[idx], G[idx], M[idx]))
-            ratio = torch.exp(dist.log_prob(A[idx]) - old_logp[idx])
-            pg = -torch.min(ratio * adv[idx], torch.clamp(ratio, 1 - args.clip, 1 + args.clip) * adv[idx]).mean()
+            if args.algo == "maa2c":       # plain policy gradient with the critic's advantage
+                pg = -(dist.log_prob(A[idx]) * adv[idx]).mean()
+            else:                          # PPO clipped surrogate (MAPPO, IPPO)
+                ratio = torch.exp(dist.log_prob(A[idx]) - old_logp[idx])
+                pg = -torch.min(ratio * adv[idx], torch.clamp(ratio, 1 - args.clip, 1 + args.clip) * adv[idx]).mean()
             vloss = ((critic(Vc[idx], Gc[idx]) - ret[idx]) ** 2).mean()
             ent = dist.entropy().mean()
             loss = pg + 0.5 * vloss - ent_coef * ent
@@ -199,10 +213,11 @@ def evaluate(pool, actor, critic, seeds, mode="eval"):
     return out
 
 
-def plot(log_path, baselines, out_png):
+def plot(log_path, baselines, out_png, name="MAPPO"):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    algo_name = name
     rows = list(csv.DictReader(open(log_path)))
     ep = np.array([float(r["episodes"]) for r in rows])
     tr = np.array([float(r["train_score"]) for r in rows])
@@ -215,7 +230,7 @@ def plot(log_path, baselines, out_png):
     vrows = [r for r in rows if r["val_greedy"]]
     ve = [float(r["episodes"]) for r in vrows]
     for key, col, name in (("val_greedy", "#1f5aa6", "with greedy teammate"), ("val_idle", "#c0392b", "with idle teammate")):
-        axes[1].plot(ve, [float(r[key]) for r in vrows], "o-", color=col, label=f"MAPPO {name}")
+        axes[1].plot(ve, [float(r[key]) for r in vrows], "o-", color=col, label=f"{algo_name} {name}")
         tm = key.split("_")[1]
         axes[1].axhline(baselines["greedy"][tm]["score"], color=col, ls="--", lw=1, label=f"greedy rule {name}")
         axes[1].axhline(baselines["feasible"][tm]["score"], color=col, ls=":", lw=1, label=f"deadline-aware rule {name}")
@@ -231,35 +246,41 @@ def plot(log_path, baselines, out_png):
 
 def main():
     p = argparse.ArgumentParser()
+    p.add_argument("--algo", choices=("mappo", "ippo", "maa2c"), default="mappo")
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--out", default="runs/mappo_seed0")
+    p.add_argument("--out", default=None, help="default: runs/<algo>_seed<seed>")
     p.add_argument("--iterations", type=int, default=150)
     p.add_argument("--episodes-per-iter", type=int, default=16)
     p.add_argument("--workers", type=int, default=max(1, min(8, (os.cpu_count() or 2))))
     p.add_argument("--eval-every", type=int, default=10)
     p.add_argument("--lr", type=float, default=3e-4)
-    p.add_argument("--epochs", type=int, default=4)
+    p.add_argument("--epochs", type=int, default=None, help="passes per batch (default 4; MAA2C 1)")
     p.add_argument("--minibatch", type=int, default=256)
     p.add_argument("--clip", type=float, default=0.2)
     p.add_argument("--val-scenarios", type=int, default=len(VAL_SEEDS))
     args = p.parse_args()
+    if args.epochs is None:
+        args.epochs = 1 if args.algo == "maa2c" else 4
+    if args.out is None:
+        args.out = f"runs/{args.algo}_seed{args.seed}"
     val_seeds = VAL_SEEDS[:args.val_scenarios]
 
     import torch
-    from agents.hrl import MODEL_VERSION as H_VERSION_, build_networks
+    from agents.hrl import ACTOR_GLOBAL_DIM, ACTOR_VICTIM_DIM, MODEL_VERSION as H_VERSION_, build_networks
     global H_VERSION
     H_VERSION = H_VERSION_
     torch.manual_seed(args.seed)
     rng = np.random.default_rng(args.seed)
     os.makedirs(args.out, exist_ok=True)
     Actor, Critic = build_networks()
-    actor, critic = Actor(), Critic()
+    actor = Actor()
+    critic = Critic(vdim=ACTOR_VICTIM_DIM, gdim=ACTOR_GLOBAL_DIM) if args.algo == "ippo" else Critic()
     opt = torch.optim.Adam(list(actor.parameters()) + list(critic.parameters()), lr=args.lr)
     kinds, probs = list(TEAMMATE_PROBS), list(TEAMMATE_PROBS.values())
 
     ctx = mp.get_context("spawn")
     with ctx.Pool(args.workers, initializer=_init_worker) as pool:
-        print(f"workers={args.workers}; evaluating rule baselines on validation scenarios...", flush=True)
+        print(f"algo={args.algo}; workers={args.workers}; evaluating rule baselines on validation scenarios...", flush=True)
         baselines = {m: evaluate(pool, None, None, val_seeds, mode=m) for m in ("greedy", "feasible")}
         for m, b in baselines.items():
             print(f"  {m:9s} rule: score {b['greedy']['score']:.1f} (greedy mate) / {b['idle']['score']:.1f} (idle mate)",
@@ -273,7 +294,8 @@ def main():
         for it in range(1, args.iterations + 1):
             a_state = {k: v.clone() for k, v in actor.state_dict().items()}
             c_state = {k: v.clone() for k, v in critic.state_dict().items()}
-            jobs = [(a_state, c_state, args.seed * 1_000_000 + episodes + k, str(rng.choice(kinds, p=probs)), "train")
+            jobs = [(a_state, c_state, args.seed * 1_000_000 + episodes + k, str(rng.choice(kinds, p=probs)), "train",
+                     args.algo)
                     for k in range(args.episodes_per_iter)]
             results = pool.map(_episode, jobs)
             episodes += len(jobs)
@@ -291,17 +313,17 @@ def main():
                 mean_val = (v["greedy"]["score"] + v["idle"]["score"]) / 2
                 if mean_val > best:
                     best = mean_val
-                    torch.save({"version": H_VERSION, "actor": actor.state_dict(), "critic": critic.state_dict(), "iteration": it,
+                    torch.save({"version": H_VERSION, "algo": args.algo, "actor": actor.state_dict(), "critic": critic.state_dict(), "iteration": it,
                                 "episodes": episodes, "val": v}, os.path.join(args.out, "best.pt"))
                 print(f"it {it:4d} | ep {episodes:5d} | train {row['train_score']:6.1f} | val greedy-mate "
                       f"{v['greedy']['score']:6.1f} idle-mate {v['idle']['score']:6.1f} | ent {ent:.2f} | "
                       f"{row['minutes']:.1f} min", flush=True)
             with open(log_path, "a", newline="") as f:
                 csv.DictWriter(f, fields).writerow(row)
-        torch.save({"version": H_VERSION, "actor": actor.state_dict(), "critic": critic.state_dict(),
+        torch.save({"version": H_VERSION, "algo": args.algo, "actor": actor.state_dict(), "critic": critic.state_dict(),
                     "iteration": args.iterations,
                     "episodes": episodes}, os.path.join(args.out, "last.pt"))
-    plot(log_path, baselines, os.path.join(args.out, "learning_curve.png"))
+    plot(log_path, baselines, os.path.join(args.out, "learning_curve.png"), name=args.algo.upper())
     print("done; best validation (mean of both teammates):", round(best, 1), "->", os.path.join(args.out, "best.pt"))
 
 

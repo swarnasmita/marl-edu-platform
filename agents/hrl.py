@@ -439,9 +439,12 @@ def build_networks():
             return logits.masked_fill(~mask, -1e9)
 
     class Critic(nn.Module):
-        def __init__(self, h=64):
+        """Centralised by default (MAPPO, MAA2C). IPPO uses Critic(vdim=ACTOR_VICTIM_DIM, gdim=ACTOR_GLOBAL_DIM):
+        the same network, but it only sees the robot's own view."""
+
+        def __init__(self, h=64, vdim=CRITIC_VICTIM_DIM, gdim=CRITIC_GLOBAL_DIM):
             super().__init__()
-            self.body = DeepSet(CRITIC_VICTIM_DIM, CRITIC_GLOBAL_DIM, h)
+            self.body = DeepSet(vdim, gdim, h)
             self.head = nn.Sequential(nn.Linear(h, h), nn.ReLU(), nn.Linear(h, 1))
 
         def forward(self, V, G):

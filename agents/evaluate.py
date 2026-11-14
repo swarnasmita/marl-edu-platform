@@ -35,7 +35,7 @@ def run_policy(pool, mode, ckpt=None):
     if ckpt is not None:
         import torch
         state = torch.load(ckpt, map_location="cpu")
-        a_state, c_state = state["actor"], state["critic"]
+        a_state, c_state = state["actor"], None      # only the actor (or Q-network) is needed to act
     jobs = [(a_state, c_state, s, tm, mode) for tm in TEAMMATES for s in TEST_SEEDS]
     res = pool.map(_episode, jobs, chunksize=4)
     return [(j[3], j[2], r[0]) for j, r in zip(jobs, res)]
@@ -57,8 +57,11 @@ def main():
     p.add_argument("--checkpoints", nargs="*", default=["runs/mappo_seed0/best.pt"])
     p.add_argument("--workers", type=int, default=max(1, min(8, os.cpu_count() or 2)))
     p.add_argument("--out", default="results")
+    p.add_argument("--label", default=None, help='name of the learned policy in the tables, e.g. "IPPO (hierarchical)"')
     p.add_argument("--table-only", action="store_true", help="rebuild the tables from eval_episodes.csv")
     args = p.parse_args()
+    if args.label:
+        LABELS["mappo"] = args.label
     os.makedirs(args.out, exist_ok=True)
     ckpts = [c for c in args.checkpoints if os.path.exists(c)]
 
@@ -75,7 +78,7 @@ def main():
             print("evaluating", LABELS[mode], flush=True)
             episodes += [(mode, 0, tm, s, st) for tm, s, st in run_policy(pool, mode)]
         for k, c in enumerate(ckpts):
-            print("evaluating MAPPO", c, flush=True)
+            print("evaluating", LABELS["mappo"], c, flush=True)
             episodes += [("mappo", k, tm, s, st) for tm, s, st in run_policy(pool, "eval", c)]
 
     with open(os.path.join(args.out, "eval_episodes.csv"), "w", newline="") as f:
@@ -112,7 +115,7 @@ def write_tables(episodes, ckpts, out):
         w.writerows(rows)
 
     note = ("± = standard error over scenarios." if len(ckpts) <= 1 else
-            f"± = standard error over scenarios for the rules; for MAPPO, sd across {len(ckpts)} training seeds.")
+            f"± = standard error over scenarios for the rules; for {LABELS['mappo'].split(' (')[0]}, sd across {len(ckpts)} training seeds.")
     lines = [f"# Disaster Response: policy comparison ({len(TEST_SEEDS)} unseen scenarios per teammate)", "",
              note, ""]
     lines += ["Success = at least 80% of total severity saved. Wait = seconds from a victim being reported to being "
@@ -145,7 +148,7 @@ def write_tables(episodes, ckpts, out):
                 rule = [values(best_rule, tm, m)[TEST_SEEDS.index(s)] for s in TEST_SEEDS]
                 diff, t = paired_t(mappo, rule)
                 pval = 2 * (1 - _norm_cdf(abs(t)))
-                lines.append(f"Paired comparison ({name}), MAPPO minus {LABELS[best_rule].lower()}: "
+                lines.append(f"Paired comparison ({name}), {LABELS['mappo'].split(' (')[0]} minus {LABELS[best_rule].lower()}: "
                              f"{diff:+.2f} (t = {t:.2f}, p ≈ {pval:.3f}, n = {len(TEST_SEEDS)}).  ")
         lines.append("")
     open(os.path.join(out, "eval_table.md"), "w").write("\n".join(lines))
