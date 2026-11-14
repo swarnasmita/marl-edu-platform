@@ -184,6 +184,7 @@ class DisasterResponseEnv(ParallelEnv):
         self.time_left = np.array([TIME_LIMIT[s] for s in self.severity], dtype=float)
         self.carrier = np.full(N_VICTIMS, -1)
         self.carrying = np.full(N_ROBOTS, -1)
+        self.pickup_only = [None] * N_ROBOTS      # see step(): which victim each robot may pick up
         self.pickup_time = np.full(N_VICTIMS, -1)     # step at which each victim was picked up (for metrics)
         self.picked_by = np.full(N_VICTIMS, -1)
         self.rescued_by = np.full(N_VICTIMS, -1)
@@ -213,8 +214,12 @@ class DisasterResponseEnv(ParallelEnv):
 
         for i in range(N_ROBOTS):
             if self.carrying[i] < 0:
-                # pick up the nearest waiting victim within reach
+                # pick up the nearest waiting victim within reach. pickup_only[i]: None = anyone (the human's
+                # robot), j = only victim j (a blue robot only picks up the victim it chose), -1 = nobody
                 waiting = np.where(self.status == WAITING)[0]
+                only = self.pickup_only[i]
+                if only is not None:
+                    waiting = waiting[waiting == only]
                 if len(waiting):
                     d = np.linalg.norm(self.victim_pos[waiting] - pos[i], axis=1)
                     k = int(np.argmin(d))

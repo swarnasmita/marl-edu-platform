@@ -868,8 +868,8 @@ def layout():
     dust(-6.3, 11.0, 0.8, 0.8)      # over the collapsed corner, not the interior
 
     # ---------- NE block: commercial, collapsed building spilling into the cross street
-    building(11.0, 15.5, 5.8, 10.0, 2, "plaster_grey", 2, name="shops_ne")
-    building(5.5, 9.5, 9.5, 15.5, 3, "plaster_grey", 3, name="collapsed_ne")
+    building(11.0, 15.5, 5.8, 9.4, 2, "plaster_grey", 2, name="shops_ne")          # leaves a 2.4 m back alley
+    building(5.5, 8.8, 9.5, 15.5, 3, "plaster_grey", 3, name="collapsed_ne")      # 2.2 m gap into the alley
     collider(-1.0, 5.5, 10.5, 13.5, h=1.5, name="spill_ne")
     b = Body((2.25, 12.0, 0))
     rubble_pile(b, 0, 0, 3.0, 1.4, 1.3, 40)
@@ -933,7 +933,7 @@ def layout():
     jersey_barriers(-16.0, -15.4, -3.5, 3.5)
     responder(-15.0, 4.3, 200, "firefighter")
     responder(-14.2, 4.6, 170, "firefighter")
-    responder(-9.6, -3.9, 160, "paramedic")
+    responder(-9.5, -2.4, 160, "paramedic")       # beside the triage entrance, not in it (keeps the gate two lanes wide)
 
     # ---------- SW block: emergency medical station and evacuation area
     WORLD.append(geom("box", pos=(-10.0, -9.0, 0.008), size=(2.5, 2.0, 0.002), mat="tarp", name="safe_zone"))

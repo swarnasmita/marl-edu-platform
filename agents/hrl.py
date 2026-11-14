@@ -46,10 +46,56 @@ class Navigator:
         self.planner = planner
         self.reset()
 
+    DETOUR_AFTER = 40          # steps (2 s) without progress next to another robot -> plan around it
+    DETOUR_STEPS = 80          # follow the detour for up to 4 s
+
     def reset(self):
         self.mover.reset()
         self.anchor, self.counter, self.escape = {}, {}, {}
         self.escape_count = 0                         # unjam manoeuvres this episode
+        self.detour_count = 0                         # detours around a robot blocking the way
+        self.progress = {}                            # i -> (goal key, best route distance, steps without progress)
+        self.detour = {}                              # i -> (goal key, field, steps left)
+        self.busy = {}                                # i -> has somewhere to go this step (set by the controller)
+
+    def _check_blocked(self, i, goal, pos):
+        """Track progress along the route; after 2 s without progress with a robot right next to us,
+        plan a route that treats that robot as an obstacle (if there is one)."""
+        key = self.planner.cell(goal)
+        d = self.planner.field(goal)[self.planner.cell(pos[i])]
+        k, best, n = self.progress.get(i, (None, np.inf, 0))
+        if k != key or d < best - 0.3:
+            self.progress[i] = (key, d, 0)
+            return
+        n += 1
+        self.progress[i] = (key, best, n)
+        if n < self.DETOUR_AFTER:
+            return
+        near = [pos[k] for k in range(len(pos)) if k != i and np.linalg.norm(pos[k] - pos[i]) < 1.8]
+        self.progress[i] = (key, best, 0)
+        if not near:
+            return
+        field = self.planner.detour_field(goal, near, pos[i])
+        if np.isfinite(field[self.planner.cell(pos[i])]):
+            self.detour[i] = (key, field, self.DETOUR_STEPS)
+            self.detour_count += 1
+
+    def make_way(self, i, pos, busy):
+        """Robot i has nothing to do: if a robot with somewhere to go (busy) is close, move aside -
+        to the free direction that gets furthest from it - instead of parking in its way."""
+        near = [k for k in busy if k != i and np.linalg.norm(pos[k] - pos[i]) < 1.8]
+        if not near:
+            return 0
+        plan = self.planner
+        best_a, best_gap = 0, min(np.linalg.norm(pos[k] - pos[i]) for k in near)
+        for a in range(1, len(DIRS)):
+            q = pos[i] + DIRS[a] * 0.4
+            if not plan.free[plan.cell(q)]:
+                continue
+            gap = min(np.linalg.norm(pos[k] - q) for k in near)
+            if gap > best_gap + 0.05:
+                best_a, best_gap = a, gap
+        return best_a
 
     def move(self, i, goal, pos):
         if self.escape.get(i, (0, 0))[0] > 0:
@@ -58,8 +104,17 @@ class Navigator:
             return a
         if goal is None:
             self.counter[i] = 0
-            return 0
-        a = self.mover.best_move(i, pos, goal)
+            busy = [k for k in range(len(pos)) if k != i and self.busy.get(k)]
+            return self.make_way(i, pos, busy)
+        key = self.planner.cell(goal)
+        dk, field, left = self.detour.get(i, (None, None, 0))
+        if dk == key and left > 0:
+            self.detour[i] = (dk, field, left - 1)
+            a = self.mover.best_move(i, pos, goal, dist=field)
+        else:
+            self.detour.pop(i, None)
+            self._check_blocked(i, goal, pos)
+            a = self.mover.best_move(i, pos, goal)
         self.mover.prev[i] = a
         # unjam if two robots block each other
         self.counter[i] = self.counter.get(i, 0) + 1
@@ -326,10 +381,15 @@ class HierarchicalController:
         pos = env.robot_positions()
         self.update_human_intent()
         out = {}
+        self.nav.busy = {k: self.goal(k) is not None for k in range(N_ROBOTS)}
+        if teammate is None or teammate.kind in ("idle", "wander"):
+            self.nav.busy[0] = True         # a real user's plan is unknown: idle blue robots keep out of their way
         for i in RL_ROBOTS:
             if self.needs_decision(i):
                 self.set_choice(i, chooser(i))
             g = self.goal(i)
+            # a blue robot only picks up the victim it chose, not anyone it passes on the way
+            env.pickup_only[i] = self.target[i] if self.target[i] is not None else -1
             if g is None and env.carrying[i] < 0:
                 self.idle_steps[i] += 1
             out[f"robot_{i}"] = self.nav.move(i, g, pos)

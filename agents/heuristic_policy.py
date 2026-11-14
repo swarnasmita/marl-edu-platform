@@ -71,10 +71,28 @@ class GridPlanner:
         if g in self._fields:
             self._fields[key] = self._fields[g]
             return self._fields[g]
+        dist = self.dijkstra(self.free, g)
+        self._fields[g] = self._fields[key] = dist
+        return dist
+
+    def detour_field(self, goal, blockers, me, radius=1.2):
+        """Distance-to-goal map that treats the given points (parked robots) as obstacles, keeping the
+        cells right around the robot itself (me) open so it can start moving. Not cached."""
+        free = self.free.copy()
+        X, Y = np.meshgrid(self.centres, self.centres, indexing="ij")
+        for b in blockers:
+            to_b = (X - b[0]) ** 2 + (Y - b[1]) ** 2
+            to_me = (X - me[0]) ** 2 + (Y - me[1]) ** 2
+            free &= ~((to_b < radius ** 2) & (to_b < to_me))     # block only the blocker's side
+        g = self.nearest_free(self.cell(goal))
+        return self.dijkstra(free, g)
+
+    def dijkstra(self, free, g):
         dist = np.full((self.n, self.n), np.inf)
+        if not free[g]:
+            return dist
         dist[g] = 0.0
         heap = [(0.0, g)]
-        free = self.free
         while heap:
             d, (i, j) = heapq.heappop(heap)
             if d > dist[i, j]:
@@ -89,7 +107,6 @@ class GridPlanner:
                         dist[a, b] = nd
                         heapq.heappush(heap, (nd, (a, b)))
         dist *= self.res
-        self._fields[g] = self._fields[key] = dist
         return dist
 
     def path_length(self, p, goal):
@@ -152,11 +169,12 @@ class GreedyPolicy:
         taken.add(best)
         return env.victim_pos[best]
 
-    def best_move(self, i, pos, goal):
+    def best_move(self, i, pos, goal, dist=None):
         """Pick the move that descends the route's distance field fastest without
-        hitting obstacles or crowding other robots."""
+        hitting obstacles or crowding other robots. dist: optional detour field to follow instead."""
         plan = self.planner
-        dist = plan.field(goal)
+        if dist is None:
+            dist = plan.field(goal)
         here = dist[plan.cell(pos[i])]
         if not np.isfinite(here):
             # inside an obstacle's safety margin: head straight for the nearest free cell
@@ -164,7 +182,7 @@ class GreedyPolicy:
             return direction_to_action(plan.point(c) - pos[i])
         if here < 0.3:
             return direction_to_action(np.asarray(goal) - pos[i])
-        best_a, best_score = 0, -np.inf
+        best_a, best_score, best_progress = 0, -np.inf, -np.inf
         for a in range(1, len(DIRS)):
             score = 0.0
             ok = True
@@ -177,9 +195,10 @@ class GreedyPolicy:
                 score = here - d            # progress along the route (metres)
             if not ok:
                 continue
+            best_progress = max(best_progress, score)
             q = pos[i] + DIRS[a] * self.PROBE[-1]
             for k in range(len(pos)):
-                if k != i:
+                if k != i and self._gives_way(i, k):
                     gap = np.linalg.norm(q - pos[k])
                     if gap < self.PERSONAL_SPACE:
                         score -= 1.5 * (self.PERSONAL_SPACE - gap)
@@ -187,7 +206,40 @@ class GreedyPolicy:
                 score += 0.05               # smoothness: keep heading when it is as good
             if score > best_score:
                 best_a, best_score = a, score
+        if best_progress <= 0.05:
+            # Tight spot (narrow alley, sharp turn): no direction is clear for the whole look-ahead, or none
+            # makes progress, so the robot would rock back and forth. Step to the neighbouring route cell
+            # that is closest to the goal instead: Dijkstra guarantees it exists and is free.
+            return self._descend(i, pos, dist, here)
         return best_a
+
+    def _gives_way(self, i, k):
+        """Right of way, so two robots meeting head-on don't both wait for each other: the human's robot
+        (robot_0) first, then a robot carrying a victim, then the lower index. Robot i keeps its distance
+        only from robots that have priority over it; the other one will move aside."""
+        if k == 0:
+            return True
+        if i == 0:
+            return False
+        ci, ck = self.env.carrying[i] >= 0, self.env.carrying[k] >= 0
+        if ci != ck:
+            return ck
+        return k < i
+
+    def _descend(self, i, pos, dist, here):
+        plan = self.planner
+        ci, cj = plan.cell(pos[i])
+        best, best_d = None, here
+        for di, dj, _ in NEIGHBOURS:
+            a, b = ci + di, cj + dj
+            if 0 <= a < plan.n and 0 <= b < plan.n and dist[a, b] < best_d:
+                if di and dj and not (plan.free[ci + di, cj] and plan.free[ci, cj + dj]):
+                    continue                # no corner cutting
+                best, best_d = (a, b), dist[a, b]
+        if best is None:
+            return 0
+        # aim a little past the neighbour's centre so the robot does not stall on the cell boundary
+        return direction_to_action(plan.point(best) - pos[i] + 0.5 * (plan.point(best) - plan.point((ci, cj))))
 
     def act(self, robot_ids):
         pos = self.env.robot_positions()

@@ -273,7 +273,7 @@ def run_episode(bench, policy, teammate, seed):
     reaction, late_crit, init_crit, efficiency = [], [], [], []
     reported, first_targeted = {}, {}
     prev_target = [None] * N_ROBOTS
-    slow = [0] * N_ROBOTS
+    slow = [None] * N_ROBOTS      # (goal key, best route distance, steps without progress)
     trip = {}                       # robot -> (victim, route length at decision, distance travelled)
     last_pos = env.robot_positions().copy()
     escapes_before = 0
@@ -316,16 +316,23 @@ def run_episode(bench, policy, teammate, seed):
                     trip[i] = [t, H.path_dist(bench.plan, pos[i], env.victim_pos[t]), 0.0]
                 elif i in trip:
                     trip[i][2] += moved[i]
-                # stuck: has somewhere to go but barely moving for 2 s or more
-                has_goal = env.carrying[i] >= 0 or (t is not None and env.status[t] == WAITING)
-                if has_goal and moved[i] < 0.15 * SPEED * DT:
-                    slow[i] += 1
-                    if slow[i] == 40:
-                        m["stuck_events"] += 1
-                    if slow[i] >= 40:
-                        m["stuck_time"] += DT
+                # stuck: has somewhere to go but its route distance has not shrunk for 5 s (moving or not -
+                # a robot rocking back and forth in a tight spot counts too)
+                g = ctrl.goal(i)
+                if g is None:
+                    slow[i] = None
                 else:
-                    slow[i] = 0
+                    key = (t, int(env.carrying[i]))
+                    d = H.path_dist(bench.plan, pos[i], g)
+                    if slow[i] is None or slow[i][0] != key or d < slow[i][1] - 0.3:
+                        slow[i] = (key, d, 0)
+                    else:
+                        n = slow[i][2] + 1
+                        slow[i] = (key, slow[i][1], n)
+                        if n == 100:
+                            m["stuck_events"] += 1
+                        if n >= 100:
+                            m["stuck_time"] += DT
                 if t is None and env.carrying[i] < 0 and np.any(env.status == WAITING):
                     m["idle_while_waiting"] += DT
             if t is not None:
@@ -408,7 +415,7 @@ def write_report(controlled, agg, out):
         ("4 Re-planning", "Survival: critical victims reported late", "late_crit", "{:.0f}%"),
         ("4 Re-planning", "Survival: critical victims known from the start", "init_crit", "{:.0f}%"),
         ("5 Waste", "Wasted trips: target lost before arrival (per episode)", "w_lost", "{:.2f}"),
-        ("5 Stuck", "Stuck events: has a goal but no progress for 2+ s (per episode)", "stuck_events", "{:.2f}"),
+        ("5 Stuck", "Stuck events: has a goal but no route progress for 5+ s (per episode)", "stuck_events", "{:.2f}"),
         ("5 Stuck", "Time stuck (s per episode)", "stuck_time", "{:.1f}"),
         ("5 Stuck", "Time two robots are touching (s per episode)", "jam", "{:.1f}"),
         ("5 Waste", "Idle while victims are waiting (s per blue robot per episode)", "idle", "{:.1f}"),
