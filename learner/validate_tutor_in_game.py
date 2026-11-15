@@ -21,11 +21,16 @@ sys.path.insert(0, ROOT)
 from learner.tutor_env import CONCEPTS, PROFILES, RULES, TutorEnv, tested   # noqa: E402
 
 CKPT = os.path.join(ROOT, "agents", "checkpoints", "mappo_disaster.pt")
-TUTOR = os.path.join(ROOT, "learner", "checkpoints", "tutor.pt")
+import learner.tutor_env as TE                                     # noqa: E402
 _W = {}
 
 
-def _init():
+def _tutor_path():
+    return os.path.join(ROOT, "learner", "checkpoints", "tutor_v2.pt" if TE.STUDENT == "v2" else "tutor.pt")
+
+
+def _init(student="v1"):
+    TE.STUDENT = student
     import torch
     torch.set_num_threads(1)
     import agents.hrl as H
@@ -35,7 +40,7 @@ def _init():
     env.reset(seed=0)
     ctrl = H.HierarchicalController(env)
     tutors = dict(RULES)
-    tutors["RL tutor (PPO)"] = PolicyTutor(load(TUTOR))
+    tutors["RL tutor (PPO)"] = PolicyTutor(load(_tutor_path()))
     _W.update(env=env, ctrl=ctrl, blue=H.MappoChooser(env, ctrl, CKPT), tutors=tutors)
 
 
@@ -79,7 +84,7 @@ def _student(job):
         scores.append(env.score)
     return dict(tutor=tutor_name, profile=profile, student=k, gain=float(T.student.K.mean() - K0.mean()),
                 final_k=float(T.student.K.mean()), interventions=T.log["interventions"], seconds=T.log["seconds"],
-                attention=float(T.student.att), decisions=T.k, score=float(np.mean(scores)),
+                attention=float(T.student.att), motivation=float(T.student.mot), decisions=T.k, score=float(np.mean(scores)),
                 correct_last=float(np.mean(T.log["correct"][-10:])) if T.log["correct"] else np.nan)
 
 
@@ -89,25 +94,29 @@ def main():
     p.add_argument("--episodes", type=int, default=5)
     p.add_argument("--tutors", nargs="+", default=["RL tutor (PPO)", "Explain mistakes", "Mastery-threshold rule",
                                                    "No help"])
+    # (attention / motivation at the end are reported too)
     p.add_argument("--workers", type=int, default=max(1, min(8, os.cpu_count() or 2)))
+    p.add_argument("--student", choices=("v1", "v2"), default="v1")
     args = p.parse_args()
+    TE.STUDENT = args.student
+    sfx = "_v2" if args.student == "v2" else ""
     jobs = [(t, prof, k, args.episodes) for t in args.tutors for prof in PROFILES for k in range(args.students)]
-    with mp.get_context("spawn").Pool(args.workers, initializer=_init) as pool:
+    with mp.get_context("spawn").Pool(args.workers, initializer=_init, initargs=(args.student,)) as pool:
         rows = pool.map(_student, jobs, chunksize=1)
     import pandas as pd
     from learner.train_tutor import paired_p
     d = pd.DataFrame(rows)
-    d.to_csv(os.path.join(ROOT, "results", "tutor_in_game.csv"), index=False)
+    d.to_csv(os.path.join(ROOT, "results", f"tutor_in_game{sfx}.csv"), index=False)
     L = ["# Pedagogical agent inside the real game", "",
-         f"Simulated students played the learner's robot in real MuJoCo episodes ({args.episodes} episodes each, "
+         f"Student model {args.student}. Simulated students played the learner's robot in real MuJoCo episodes ({args.episodes} episodes each, "
          f"{args.students} students per profile, the same students for every tutor), with the trained blue robots. "
          "The tutor acted at every real decision of the student.", "",
-         "| Tutor | Learning gain | Decisions | Interventions | Interruption (s) | Attention at end | Team score |",
-         "|---|---|---|---|---|---|---|"]
+         "| Tutor | Learning gain | Decisions | Interventions | Interruption (s) | Attention at end | Motivation at end | "
+         "Team score |", "|---|---|---|---|---|---|---|---|"]
     for t in args.tutors:
         x = d[d.tutor == t]
         L.append(f"| {t} | {x.gain.mean():.3f} | {x.decisions.mean():.0f} | {x.interventions.mean():.1f} | "
-                 f"{x.seconds.mean():.0f} | {x.attention.mean():.2f} | {x.score.mean():.1f} |")
+                 f"{x.seconds.mean():.0f} | {x.attention.mean():.2f} | {x.motivation.mean():.2f} | {x.score.mean():.1f} |")
     L += ["", "## Learning gain by profile", "", "| Tutor | " + " | ".join(PROFILES) + " |",
           "|---" * (len(PROFILES) + 1) + "|"]
     for t in args.tutors:
@@ -124,7 +133,19 @@ def main():
         iv, _ = paired_p(ref.interventions.values, o.interventions.values)
         sc, ps = paired_p(ref.score.values, o.score.values)
         L.append(f"| {t} | {g:+.3f} | {pg:.4f} | {iv:+.1f} | {sc:+.1f} | {ps:.3f} |")
-    open(os.path.join(ROOT, "results", "tutor_in_game.md"), "w").write("\n".join(L) + "\n")
+    L += ["", "## Interruptions, attention and motivation, RL tutor vs each rule (paired)", "",
+          "| Rule | Interventions difference | p | Attention difference | p | Motivation difference | p |",
+          "|---|---|---|---|---|---|---|"]
+    for t in args.tutors:
+        if t in ("RL tutor (PPO)", "No help"):
+            continue
+        o = d[d.tutor == t].sort_values(["profile", "student"])
+        cells = []
+        for col in ("interventions", "attention", "motivation"):
+            v, pv = paired_p(ref[col].values, o[col].values)
+            cells += [f"{v:+.2f}", f"{pv:.4f}"]
+        L.append(f"| {t} | " + " | ".join(cells) + " |")
+    open(os.path.join(ROOT, "results", f"tutor_in_game{sfx}.md"), "w").write("\n".join(L) + "\n")
     print("\n".join(L))
 
 

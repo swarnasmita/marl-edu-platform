@@ -10,11 +10,12 @@ import os
 
 import numpy as np
 
-from learner.learner_model import judge_choice, situation
+from learner.learner_model import add_arrival_times, judge_choice, situation
 from learner.tutor_env import ASK0, CONCEPTS, EXPLAIN0, HINT0, N_ACTIONS, QUIET, SESSION, tested
 from learner.tutor_messages import message
 
 TUTOR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints", "tutor.pt")
+TUTOR_V2 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints", "tutor_v2.pt")
 
 
 class LiveTutor:
@@ -22,16 +23,22 @@ class LiveTutor:
         import torch
         from learner.train_tutor import load
         self.torch, self.net = torch, load(path)
+        self.v2 = torch.load(path, map_location="cpu", weights_only=False).get("student") == "v2"
         self.env, self.ctrl, self.model, self.expert, self.me = env, ctrl, model, expert, learner
         self.reset()
+
+    MODES = ("rl", "always")      # rl = trained pedagogical agent; always = 'always help' rule (for demos)
+    mode = "rl"
 
     def reset(self):
         """New learner (same as LearnerModel.reset)."""
         self.k, self.since_help, self.recent, self.last_quality = 0, 10, [], 0.5
+        self.since_tested, self.streak = np.full(len(CONCEPTS), 10.0), 0
         self.new_episode()
 
     def new_episode(self):
         self.prompted, self.helped_before, self.was_free = False, False, False
+        self.wait = 0
         self.n_decisions = len(self.model.decisions)
 
     # ------------------------------------------------------------------ observation, as in TutorEnv.obs()
@@ -45,22 +52,57 @@ class LiveTutor:
         res = np.array([(1 if result[c] else -1) if c in result else 0 for c in CONCEPTS], float)
         return np.concatenate([mastery, np.minimum(evidence, 10) / 10, last, nowv, res,
                                [phase, min(self.since_help, 10) / 10, sum(self.recent[-5:]) / 5,
-                                min(self.k, SESSION) / SESSION, self.last_quality]]).astype(np.float32)
+                                min(self.k, SESSION) / SESSION, self.last_quality]]
+                              + ([np.minimum(self.since_tested, 10) / 10, [min(self.streak, 5) / 5]] if self.v2 else [])
+                              ).astype(np.float32)
+
+    def _speaker(self, action, s=None, victim=None):
+        """The robot that should say it: for coordination, the robot heading for (or nearest to) the victim in
+        question - "I'm already going there"; otherwise the blue robot nearest to the learner."""
+        env, ctrl = self.env, self.ctrl
+        pos = env.robot_positions()
+        blues = (1, 2)
+        concept = CONCEPTS[(action - HINT0) % len(CONCEPTS)]
+        if concept == "coordination":
+            if s is not None and victim is None:          # hint: the claimed victim the hint talks about
+                claimed = [(o["mate_dist"], j) for j, o in s["options"].items() if o["claimed"]]
+                victim = min(claimed)[1] if claimed else None
+            if victim is not None:
+                going = [k for k in blues if ctrl.target[k] == victim]
+                k = min(going or blues, key=lambda k: np.linalg.norm(pos[k] - env.victim_pos[victim]))
+                return f"R{k}"
+        k = min(blues, key=lambda k: np.linalg.norm(pos[k] - pos[self.me]))
+        return f"R{k}"
 
     def _act(self, obs, mask):
+        if self.mode == "always":          # baseline rule: hint the weakest tested concept, explain every mistake
+            phase = obs[5 * len(CONCEPTS)]
+            if phase == 0:
+                hints = [a for a in range(HINT0, ASK0) if mask[a]]
+                return min(hints, key=lambda a: obs[a - HINT0]) if hints else QUIET
+            res = obs[4 * len(CONCEPTS):5 * len(CONCEPTS)]
+            wrong = [EXPLAIN0 + i for i in range(len(CONCEPTS)) if res[i] < 0]
+            return wrong[0] if wrong else QUIET
         t = self.torch
         with t.no_grad():
             lg = self.net.logits(t.from_numpy(obs)[None], t.from_numpy(mask)[None])
         return int(lg.argmax())
 
     # ------------------------------------------------------------------ live loop
-    def on_step(self, events):
+    def on_step(self, events, now=False):
+        """now=True: prompt immediately (the blue robots have already chosen, e.g. at the start of a round).
+        Otherwise a new decision moment is handled one step later, after the blue robots have re-decided
+        (they re-plan when a victim is reported), so hints don't send the learner to a victim a robot is
+        about to take."""
         env, m = self.env, self.model
         free = env.carrying[self.me] < 0
         reported = any(kind == "report" for kind, _, _ in events)
         if free and (not self.was_free or reported):
             self.prompted = False                      # a new decision moment
+            self.wait = 0 if now else 2
         self.was_free = free
+        if self.wait > 0:
+            self.wait -= 1
         out = None
 
         # after the learner's choice has been judged: explain or stay quiet
@@ -69,6 +111,10 @@ class LiveTutor:
             d = m.decisions[-1]
             if d["quality"] is not None:
                 self.last_quality = d["quality"]
+            self.streak = 0 if all(d["results"].values()) else self.streak + 1
+            self.since_tested += 1
+            for c in d["results"]:
+                self.since_tested[CONCEPTS.index(c)] = 0
             mask = np.zeros(N_ACTIONS, bool)
             mask[QUIET] = True
             for c in d["results"]:
@@ -80,11 +126,12 @@ class LiveTutor:
             self.since_help = 0 if helped else self.since_help + 1
             self.helped_before = False
             if a != QUIET:
-                speaker, text = message(a, None, d["results"], d["notes"])
+                speaker, text = message(a, None, d["results"], d["notes"],
+                                        speaker=self._speaker(a, victim=d["victim"]))
                 out = (speaker, "explain", text)
 
         # before the learner chooses: hint, ask or stay quiet (once per decision moment)
-        elif free and not self.prompted:
+        elif free and not self.prompted and self.wait == 0:
             s = situation(env, self.ctrl, self.me, self.expert, m.last_report_t)
             if len(s["options"]) >= 2:
                 self.prompted = True
@@ -98,6 +145,7 @@ class LiveTutor:
                 a = self._act(self._obs(0, now, {}), mask)
                 self.helped_before = a != QUIET
                 if a != QUIET:
-                    speaker, text = message(a, s)
+                    add_arrival_times(env, self.ctrl, s, self.me)
+                    speaker, text = message(a, s, speaker=self._speaker(a, s=s))
                     out = (speaker, "ask" if a >= ASK0 else "hint", text)
         return out

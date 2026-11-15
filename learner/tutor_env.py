@@ -47,6 +47,17 @@ BKT = dict(p_init=0.2, p_learn=0.12, p_slip=0.1, p_guess=0.25)       # same as t
 SIM = dict(a_practice=0.03, a_explain=0.25, a_hint=0.10, a_ask=0.18, noise=0.10,
            att_cost=dict(hint=0.06, ask=0.10, explain=0.08), att_unneeded=0.08, att_recover=0.04,
            hint_follow=0.9, ask_boost=0.5, expert_k=0.75)
+# Student model v2 adds motivation and forgetting (assumptions, documented in results/pedagogical_agent.md):
+#   motivation in [0.1, 1]: successes +, mistakes -, criticism (explaining a mistake) slightly -, encouragement
+#     (explaining a good choice) + but less if given often; low motivation -> slower learning, careless choices
+#   forgetting: knowledge of a concept not practised in a decision decays towards what the student started with;
+#     a hint / question on a concept not seen for a while works better (spacing and testing effects)
+SIM_V2 = dict(SIM, version=2, mot_init=(0.5, 0.8), mot_success=0.02, mot_mistake=0.03, mot_criticism=0.02,
+              mot_praise=0.08, praise_wear=0.25, mot_scaffold=0.03, forget=0.015, spacing_after=5,
+              spacing_bonus=dict(ask=1.5, hint=1.2))
+STUDENT = "v1"                  # default student model for TutorEnv (train_tutor.py --student sets it)
+OBS_DIM_V2 = OBS_DIM + NC + 1
+
 PROFILES = {
     "novice": dict(prior=(0.05, 0.25)),
     "intermediate": dict(prior=(0.3, 0.6)),
@@ -90,6 +101,16 @@ class Student:
         else:
             self.K = rng.uniform(*pr, size=NC)
         self.att = 1.0
+        self.v2 = sim.get("version", 1) == 2
+        self.K_start = self.K.copy()
+        self.mot = rng.uniform(*sim["mot_init"]) if self.v2 else 1.0
+
+    def noise(self):
+        return self.sim["noise"] + (0.25 * (1 - self.mot) if self.v2 else 0.0)
+
+    def adjust_mot(self, d):
+        if self.v2:
+            self.mot = float(np.clip(self.mot + d, 0.1, 1.0))
 
     def choose(self, s, boost):
         """boost: {concept index: probability of applying it this time} from a hint / question."""
@@ -101,12 +122,19 @@ class Student:
                 keep = [j for j in cand if s["results"][j].get(c, True)]
                 if keep:
                     cand = keep
-        if self.rng.random() < self.sim["noise"]:
+        if self.rng.random() < self.noise():
             return cand[self.rng.integers(len(cand))]
         return min(cand, key=lambda j: s["options"][j]["dist"])
 
     def _gain(self, ci, rate):
-        self.K[ci] += min(1.0, rate * self.lr) * (1 - self.K[ci])
+        m = (0.4 + 0.6 * self.mot) if self.v2 else 1.0
+        self.K[ci] += min(1.0, rate * self.lr * m) * (1 - self.K[ci])
+
+    def forget(self, practised):
+        if self.v2:
+            for ci in range(NC):
+                if ci not in practised:
+                    self.K[ci] -= self.sim["forget"] * max(0.0, self.K[ci] - self.K_start[ci])
 
     def _spend(self, kind, unneeded):
         self.att = max(0.0, self.att - self.impatience * (self.sim["att_cost"][kind] +
@@ -117,8 +145,10 @@ class TutorEnv:
     """Batched-friendly single environment. Steps alternate between the 'before' and 'after' phase of each
     decision. obs() -> observation, mask() -> valid actions, step(a) -> reward, done."""
 
-    def __init__(self, rng, profile=None, split="train", lr=None, impatience=None, sim=SIM):
+    def __init__(self, rng, profile=None, split="train", lr=None, impatience=None, sim=None):
+        sim = sim if sim is not None else (SIM_V2 if STUDENT == "v2" else SIM)
         self.rng, self.split, self.sim = rng, split, sim
+        self.v2 = sim.get("version", 1) == 2
         self.profile = profile or rng.choice(list(PROFILES))
         lr = lr if lr is not None else float(rng.choice([0.6, 1.0, 1.5]))
         imp = impatience if impatience is not None else float(rng.choice([0.6, 1.0, 1.6]))
@@ -130,6 +160,8 @@ class TutorEnv:
         self.last = np.zeros(NC)                      # +1 / -1 outcome of the last judgement per concept
         self.k, self.phase = 0, 0                     # decision index, 0 = before, 1 = after
         self.since_help, self.recent = 10, []
+        self.since_tested = np.full(NC, 10.0)          # decisions since each concept was last judged (observable)
+        self.streak, self.praised = 0, []               # current run of mistakes; praise given per decision
         self.log = dict(interventions=0, seconds=0.0, correct=[], quality=[], actions=[])
         self._next_situation()
 
@@ -148,6 +180,7 @@ class TutorEnv:
         return np.concatenate([self.mastery, np.minimum(self.evidence, 10) / 10, self.last, now, res,
                                [self.phase, min(self.since_help, 10) / 10, sum(self.recent[-5:]) / 5,
                                 self.k / SESSION, self.log["quality"][-1] if self.log["quality"] else 0.5]]
+                             + ([np.minimum(self.since_tested, 10) / 10, [min(self.streak, 5) / 5]] if self.v2 else [])
                               ).astype(np.float32)
 
     def mask(self):
@@ -173,7 +206,7 @@ class TutorEnv:
                 unneeded = st.K[ci] > sim["expert_k"]
                 self.boost[ci] = max(st.K[ci], sim["hint_follow"] * st.att)
                 if not unneeded:
-                    st._gain(ci, sim["a_hint"] * st.att)
+                    st._gain(ci, sim["a_hint"] * st.att * self._spacing(ci, "hint"))
                 st._spend("hint", unneeded)
                 self.hinted.add(ci)
                 seconds = SECONDS["hint"]
@@ -182,7 +215,7 @@ class TutorEnv:
                 k = st.K[ci]
                 zpd = 1.0 if 0.25 < k < 0.75 else 0.4
                 self.boost[ci] = max(k, k + sim["ask_boost"] * (1 - k) * st.att)
-                st._gain(ci, sim["a_ask"] * st.att * zpd)
+                st._gain(ci, sim["a_ask"] * st.att * zpd * self._spacing(ci, "ask"))
                 st._spend("ask", k > sim["expert_k"])
                 seconds = SECONDS["ask"]
             # the learner now chooses
@@ -198,6 +231,14 @@ class TutorEnv:
                 if ok:
                     st._gain(ci, sim["a_practice"] * (0.3 if ci in self.hinted else 1.0))
                 self._bkt(ci, ok)
+            if self.v2:
+                st.adjust_mot(sim["mot_success"] + (sim["mot_scaffold"] if self.hinted else 0.0) if ok_all
+                              else -sim["mot_mistake"])
+                st.forget({CONCEPTS.index(c) for c in self.result} | set(self.boost))
+                self.streak = 0 if ok_all else self.streak + 1
+                self.since_tested += 1
+                for c in self.result:
+                    self.since_tested[CONCEPTS.index(c)] = 0
             self.phase = 1
         else:
             if a >= EXPLAIN0:
@@ -206,6 +247,13 @@ class TutorEnv:
                 st._gain(ci, sim["a_explain"] * st.att * (1.0 if wrong else 0.2))
                 st._spend("explain", not wrong)
                 seconds = SECONDS["explain"]
+                if self.v2:
+                    if wrong:
+                        st.adjust_mot(-sim["mot_criticism"])
+                    else:                                   # encouragement wears off if given often
+                        st.adjust_mot(sim["mot_praise"] * max(0.0, 1 - sim["praise_wear"] * sum(self.praised[-5:])))
+            if self.v2:
+                self.praised.append(int(a >= EXPLAIN0 and self.result.get(CONCEPTS[a - EXPLAIN0]) is True))
             self.phase = 0
             self.k += 1
             helped_decision = helped or self.helped_before
@@ -223,6 +271,11 @@ class TutorEnv:
         r = 100 * (st.K.mean() - before) - 0.15 * seconds - 0.5 * (1 - st.att) * (self.phase == 0)
         return float(r), self.k >= SESSION
 
+    def _spacing(self, ci, kind):
+        if self.v2 and self.since_tested[ci] >= self.sim["spacing_after"]:
+            return self.sim["spacing_bonus"][kind]
+        return 1.0
+
     def _bkt(self, ci, ok):
         pL, s, g = self.mastery[ci], BKT["p_slip"], BKT["p_guess"]
         post = pL * (1 - s) / (pL * (1 - s) + (1 - pL) * g) if ok else pL * s / (pL * s + (1 - pL) * (1 - g))
@@ -234,7 +287,7 @@ class TutorEnv:
         st = self.student
         return dict(profile=self.profile, final_k=float(st.K.mean()), gain=float(st.K.mean() - self.K0.mean()),
                     interventions=self.log["interventions"], seconds=self.log["seconds"],
-                    attention=float(st.att), correct_last10=float(np.mean(self.log["correct"][-10:])),
+                    attention=float(st.att), motivation=float(st.mot), correct_last10=float(np.mean(self.log["correct"][-10:])),
                     quality_last10=float(np.mean(self.log["quality"][-10:])))
 
 
@@ -259,6 +312,17 @@ def rule_explain_errors(env):
     return EXPLAIN0 + wrong[0] if wrong else QUIET
 
 
+def rule_explain_praise(env):
+    """A common teacher heuristic: explain every mistake and encourage every good choice."""
+    if env.phase == 0:
+        return QUIET
+    wrong = [CONCEPTS.index(c) for c, ok in env.result.items() if not ok]
+    if wrong:
+        return EXPLAIN0 + wrong[0]
+    good = [CONCEPTS.index(c) for c, ok in env.result.items() if ok]
+    return EXPLAIN0 + good[0] if good else QUIET
+
+
 def rule_mastery(env):
     """Standard intelligent-tutoring rule using the learner model: hint a tested concept whose estimated mastery
     is below 0.4; explain a mistake on a concept whose estimated mastery is below 0.7; otherwise stay quiet."""
@@ -275,4 +339,5 @@ def rule_random(env):
 
 
 RULES = {"No help": rule_never, "Always help": rule_always, "Explain mistakes": rule_explain_errors,
+         "Explain mistakes + praise": rule_explain_praise,
          "Mastery-threshold rule": rule_mastery, "Random": rule_random}

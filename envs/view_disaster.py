@@ -14,9 +14,10 @@ playing, it estimates how well you understand five RL ideas (Bayesian
 Knowledge Tracing) and explains each decision it judged. It persists across
 restarts (R); press K to start a fresh learner profile.
 
-Robot tutor (pedagogical agent, learner/checkpoints/tutor.pt): at your decisions the blue robots may give a
+Robot tutor (pedagogical agent, learner/checkpoints/tutor_v2.pt, else tutor.pt): at your decisions the blue robots may give a
 hint, ask a question (the game pauses - press Space to continue) or explain your last choice - or stay quiet.
-It was trained with RL to help when it pays off and not to interrupt too much. Press T to switch it off/on.
+It was trained with RL to help when it pays off and not to interrupt too much. Press T to cycle: trained RL tutor -> 'always help' rule (demo: a hint before
+every decision) -> off.
 
 Mouse (free camera): left-drag = rotate, right-drag = pan, wheel = zoom.
 Keys: arrows = move, C = next camera, F = free camera follows your robot,
@@ -36,10 +37,10 @@ from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QApplication, QHBoxLayout, QLabel, QVBoxLayout, QWidget
 
-from agents.heuristic_policy import direction_to_action
+from agents.heuristic_policy import NEIGHBOURS, direction_to_action
 from agents.hrl import WAIT, HierarchicalController, MappoChooser, greedy_choice
 from learner.learner_model import CONCEPTS, LearnerModel
-from learner.live_tutor import TUTOR, LiveTutor
+from learner.live_tutor import TUTOR, TUTOR_V2, LiveTutor
 from envs.disaster_env import (CAMERAS, CARRIED, DT, LEARNER, LOST, MAX_STEPS, N_ROBOTS, N_VICTIMS,
                                R_RESCUE, RAY_ANGLES, RAY_RANGE, SAFE_CENTER, SEVERITY_COLOURS,
                                SEVERITY_NAMES, UNREPORTED, URGENT_STEPS, WAITING, DisasterResponseEnv)
@@ -132,10 +133,13 @@ class Viewer(QWidget):
         self.mappo = MappoChooser(self.env, self.ctrl, CHECKPOINT) if os.path.exists(CHECKPOINT) else None
         self.brain = "mappo" if self.mappo else "greedy"
         self.learner = LearnerModel(self.env, self.ctrl, expert=self.mappo)
-        self.tutor = LiveTutor(self.env, self.ctrl, self.learner, self.mappo) \
-            if (self.mappo is not None and os.path.exists(TUTOR)) else None
+        tutor_path = TUTOR_V2 if os.path.exists(TUTOR_V2) else TUTOR     # v2: trained with motivation + forgetting
+        self.tutor = LiveTutor(self.env, self.ctrl, self.learner, self.mappo, path=tutor_path) \
+            if (self.mappo is not None and os.path.exists(tutor_path)) else None
         self.tutor_on = self.tutor is not None
         self.speech = None             # (speaker, kind, text, until step) shown as a speech bubble
+        self.route = None              # (points, until step): way around an obstacle when you're stuck
+        self.trail = []                # your recent positions, to notice when you're pushing without moving
         self.paused = False
         self.panel = LearnerPanel()
         self.feedback = None
@@ -172,7 +176,18 @@ class Viewer(QWidget):
         self.learner.new_episode()
         if self.tutor is not None:
             self.tutor.new_episode()
-        self.speech, self.paused = None, False
+        self.speech, self.route, self.trail = None, None, []
+        # start paused: look at the scene and plan the first move (and read any hint) before the clock runs
+        self.paused = True
+        self.message = "New operation: look at the victims and plan your first move - press Space to start."
+        if self.tutor_on:
+            # let the blue robots choose their first targets (no time passes), then the tutor speaks
+            self.ctrl.actions(self.choose, teammate=None, learner_action=0)
+            said = self.tutor.on_step([], now=True)
+            if said is not None:
+                speaker, kind, text = said
+                self.speech = (speaker, kind, text, self.env.t + 240)
+                self.feedback = f"{speaker}: {text}"
         self.draw()
 
     # --- keyboard -------------------------------------------------------------------
@@ -196,16 +211,27 @@ class Viewer(QWidget):
             self.show_rays = not self.show_rays
             self.draw()
         elif k == Qt.Key_Space and self.paused:
-            self.paused, self.speech = False, None
-            self.message = "Back to the rescue."
-        elif k == Qt.Key_T:
+            self.paused = False
+            if self.speech is not None and self.speech[1] == "ask":
+                self.speech = None                     # a question is dismissed; a hint stays up for a while
+            elif self.speech is not None:
+                self.speech = (*self.speech[:3], self.env.t + 240)
+            self.message = "Go!" if self.env.t == 0 else "Back to the rescue."
+        elif k == Qt.Key_T:            # cycle: RL tutor -> 'always help' rule (demo) -> off
             if self.tutor is None:
                 self.message = "No trained tutor found (learner/checkpoints/tutor.pt)."
             else:
-                self.tutor_on = not self.tutor_on
+                if not self.tutor_on:
+                    self.tutor_on, self.tutor.mode = True, "rl"
+                elif self.tutor.mode == "rl":
+                    self.tutor.mode = "always"
+                else:
+                    self.tutor_on = False
                 self.speech, self.paused = None, False
-                self.message = "Robot tutor " + ("on: the blue robots may give hints, ask or explain."
-                                                 if self.tutor_on else "off.")
+                self.message = {True: {"rl": "Robot tutor: trained RL tutor - helps only when it expects it to pay off.",
+                                       "always": "Robot tutor: 'always help' rule (demo) - a hint before every "
+                                                 "decision and an explanation after every mistake."},
+                                False: {"rl": "Robot tutor off.", "always": "Robot tutor off."}}[self.tutor_on][self.tutor.mode]
             self.draw()
         elif k == Qt.Key_K:
             self.learner.reset()
@@ -267,6 +293,11 @@ class Viewer(QWidget):
         self.draw()
 
     # --- main loop ------------------------------------------------------------------
+    def tutor_label(self):
+        if not self.tutor_on:
+            return "off"
+        return "RL tutor" if self.tutor.mode == "rl" else "always help - demo"
+
     def brain_name(self):
         return "MAPPO (trained)" if self.brain == "mappo" else "greedy rule"
 
@@ -293,6 +324,10 @@ class Viewer(QWidget):
                 if kind == "ask":
                     self.paused = True
                     self.message = f"{speaker} asks you something - think about it, then press Space to continue."
+            if said is None and len(self.learner.decisions) > n_before:
+                d = self.learner.decisions[-1]
+                if d["results"] and all(d["results"].values()):     # quiet, non-interrupting acknowledgement
+                    self.feedback = "✓ Good call - " + self.learner.last_feedback().split(": ", 1)[-1]
         elif len(self.learner.decisions) > n_before:
             self.feedback = self.learner.last_feedback()
         if self.speech is not None and not self.paused and self.env.t > self.speech[3]:
@@ -305,9 +340,53 @@ class Viewer(QWidget):
         if not self.env.agents:
             self.message = (f"Operation over - rescued {self.env.rescued_count}/{N_VICTIMS}, "
                             f"lost {self.env.lost_count}. Press R to start again.")
+        self.update_route()
         if self.follow_me:
             self.env.free_cam.lookat[:2] = self.env.robot_positions()[0]
         self.draw()
+
+    def update_route(self):
+        """Route helper: if you keep pressing arrows but hardly move for 1.5 s (pushing against debris, a fallen
+        pole, a car...), show a dotted route around it to the victim you're closest to (or to triage if you're
+        carrying someone). The route disappears once you get there or after 15 s."""
+        env = self.env
+        env_pos = env.robot_positions()[0]
+        self.trail = (self.trail + [env_pos.copy()])[-30:]
+        goal = SAFE_CENTER if env.carrying[0] >= 0 else None
+        if goal is None:
+            waiting = np.flatnonzero(env.status == WAITING)
+            if len(waiting):
+                goal = env.victim_pos[min(waiting, key=lambda j: np.linalg.norm(env.victim_pos[j] - env_pos))]
+        if self.route is not None:
+            pts, until, g = self.route
+            if env.t > until or g is None or np.linalg.norm(env_pos - g) < 1.2 or \
+                    (goal is not None and np.linalg.norm(goal - g) > 0.1):
+                self.route = None
+        pushing = any(k in self.pressed for k in (Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down))
+        stuck = pushing and len(self.trail) == 30 and np.linalg.norm(self.trail[-1] - self.trail[0]) < 0.3
+        if stuck and goal is not None and self.route is None:
+            pts = self.route_points(env_pos, goal)
+            if len(pts) > 1:
+                self.route = (pts, env.t + 300, np.array(goal))
+                self.message = "Blocked - something is in the way. Follow the dotted route around it."
+
+    def route_points(self, start, goal):
+        """Walk down the route planner's distance map from start to goal."""
+        plan = self.ctrl.planner
+        dist = plan.field(goal)
+        c = plan.nearest_free(plan.cell(start))
+        pts = [np.asarray(start, float)]
+        for _ in range(600):
+            if dist[c] < 0.3 or not np.isfinite(dist[c]):
+                break
+            best = min(((c[0] + di, c[1] + dj) for di, dj, _ in NEIGHBOURS
+                        if 0 <= c[0] + di < plan.n and 0 <= c[1] + dj < plan.n), key=lambda q: dist[q])
+            if dist[best] >= dist[c]:
+                break
+            c = best
+            pts.append(plan.point(c))
+        pts.append(np.asarray(goal, float))
+        return pts[::3] + [pts[-1]]
 
     def describe(self, kind, robot, victim):
         sev = self.env.severity[victim]
@@ -339,7 +418,7 @@ class Viewer(QWidget):
             f"Camera: {CAMERA_LABELS[env.camera]}   |   Blue robots: {self.brain_name()} (M)\n"
             f"{self.message}\n"
             f"Arrows move  ·  C camera  ·  F follow  ·  mouse rotate/pan/zoom  ·  H highlights  ·  "
-            f"L sensors  ·  R restart  ·  T robot tutor ({'on' if self.tutor_on else 'off'})"
+            f"L sensors  ·  R restart  ·  T robot tutor ({self.tutor_label()})"
         )
 
     def label(self, p, x, y, text, colour):
@@ -443,6 +522,14 @@ class Viewer(QWidget):
                 p.setPen(QPen(QColor(40, 130, 245, 200), 2, Qt.DashLine))
                 p.drawLine(QPointF(ax, ay), QPointF(bx, by))
 
+        # your route around an obstacle (when you got stuck)
+        if self.route is not None:
+            pr = env.project([[*q, 0.2] for q in self.route[0]])
+            p.setPen(QPen(QColor(170, 80, 255, 230), 3, Qt.DotLine))
+            for (ax, ay), (bx, by) in zip(pr[:-1], pr[1:]):
+                if np.isfinite(ax) and np.isfinite(bx):
+                    p.drawLine(QPointF(ax, ay), QPointF(bx, by))
+
         # robots
         pts = env.project([[*pos[i], 1.3] for i in range(N_ROBOTS)])
         for i in range(N_ROBOTS):
@@ -471,7 +558,7 @@ class Viewer(QWidget):
         bw = 380
         p.setFont(QFont("Segoe UI", 9))
         body = p.fontMetrics().boundingRect(0, 0, bw - 20, 400, Qt.TextWordWrap, text)
-        bh = body.height() + 34 + (16 if kind == "ask" else 0)
+        bh = body.height() + 34 + (16 if (kind == "ask" or self.paused) else 0)
         bx = float(np.clip(x - bw / 2, 8, W - bw - 8))
         by = float(np.clip(y - bh, 8, H - bh - 8))
         p.setPen(QPen(QColor(40, 130, 245), 2))
@@ -488,6 +575,10 @@ class Viewer(QWidget):
             p.setPen(QColor(120, 120, 130))
             p.setFont(QFont("Segoe UI", 8))
             p.drawText(QRectF(bx + 10, by + bh - 20, bw - 20, 16), Qt.AlignLeft, "Game paused - press Space to continue")
+        elif self.paused:
+            p.setPen(QColor(120, 120, 130))
+            p.setFont(QFont("Segoe UI", 8))
+            p.drawText(QRectF(bx + 10, by + bh - 18, bw - 20, 16), Qt.AlignLeft, "Press Space to start")
 
 
 if __name__ == "__main__":

@@ -23,7 +23,7 @@ How it works
 import numpy as np
 
 from agents.hrl import WAIT, actor_features, path_dist
-from envs.disaster_env import DT, N_VICTIMS, SEVERITY_NAMES, SPEED, WAITING
+from envs.disaster_env import CARRY_SPEED, DT, N_VICTIMS, SAFE_CENTER, SEVERITY_NAMES, SPEED, WAITING
 
 CONCEPTS = {
     "priority": "Prioritising by severity (reward design)",
@@ -59,6 +59,30 @@ def situation(env, ctrl, me, expert, last_report_t):
                           new=bool(V[j, 11] > 0))
     probs = expert.probs(me) if expert is not None else None
     return dict(t=env.t, pos=pos.copy(), options=options, probs=probs, since_report=(env.t - last_report_t) * DT)
+
+
+def add_arrival_times(env, ctrl, s, me=0):
+    """For each option, add my_eta (seconds for the learner to get there) and robot_eta (earliest a blue robot
+    could get there, counting the time to finish its current job: deliver, or rescue its current target).
+    Used by the tutor's hints, so they only point the learner to victims the learner would reach first."""
+    plan = ctrl.planner
+    pos = env.robot_positions()
+    d = lambda a, b: path_dist(plan, a, b)
+    for j, o in s["options"].items():
+        vj = env.victim_pos[j]
+        etas = []
+        for k in (1, 2):
+            if env.carrying[k] >= 0:
+                eta = d(pos[k], SAFE_CENTER) / CARRY_SPEED + d(SAFE_CENTER, vj) / SPEED
+            elif ctrl.target[k] is not None and ctrl.target[k] != j and env.status[ctrl.target[k]] == WAITING:
+                vt = env.victim_pos[ctrl.target[k]]
+                eta = d(pos[k], vt) / SPEED + d(vt, SAFE_CENTER) / CARRY_SPEED + d(SAFE_CENTER, vj) / SPEED
+            else:
+                eta = d(pos[k], vj) / SPEED
+            etas.append(eta)
+        o["my_eta"] = o["dist"] / SPEED
+        o["robot_eta"] = float(min(etas))
+    return s
 
 
 def judge_choice(opts, j, probs, since_report):
