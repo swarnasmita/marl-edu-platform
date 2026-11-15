@@ -40,6 +40,89 @@ NEW_REPORT_S = 8.0
 GAMMA_PER_S = 0.95             # discount used to explain near-vs-far choices: value = severity * 0.95 ** seconds
 
 
+def situation(env, ctrl, me, expert, last_report_t):
+    """What robot `me` (the learner) could choose between right now: every waiting, reachable victim with its
+    severity, route distance, time left, slack, whether a blue robot is heading there, and whether it was
+    just reported; plus the trained policy's probabilities from the learner's position."""
+    pos = env.robot_positions()[me]
+    V, _, mask = actor_features(env, ctrl, me, mask_infeasible=False)
+    options = {}
+    for j in range(N_VICTIMS):
+        if env.status[j] != WAITING or not mask[j]:
+            continue
+        claimed_by = [k for k in (1, 2) if ctrl.target[k] == j]
+        mate_d = min([path_dist(ctrl.planner, env.robot_positions()[k], env.victim_pos[j]) for k in claimed_by],
+                     default=np.inf)
+        options[j] = dict(sev=int(env.severity[j]), dist=float(V[j, 5] * 40.0),
+                          time_left=float(env.time_left[j] * DT) if env.severity[j] > 1 else None,
+                          slack=float(V[j, 7]), claimed=bool(claimed_by), mate_dist=float(mate_d),
+                          new=bool(V[j, 11] > 0))
+    probs = expert.probs(me) if expert is not None else None
+    return dict(t=env.t, pos=pos.copy(), options=options, probs=probs, since_report=(env.t - last_report_t) * DT)
+
+
+def judge_choice(opts, j, probs, since_report):
+    """Judge choosing victim j in a situation. Returns ({concept: correct?}, [explanations], quality or None).
+    Only the concepts this situation actually tests appear in the results."""
+    me = opts[j]
+    others = {k: o for k, o in opts.items() if k != j}
+    results, notes = {}, []
+
+    # priority: was a clearly more severe victim available for similar effort?
+    fair = {k: o for k, o in others.items() if o["dist"] <= me["dist"] + COMPARABLE_EXTRA_M and o["slack"] >= 0}
+    if any(o["sev"] != me["sev"] for o in fair.values()):
+        better = [k for k, o in fair.items() if o["sev"] > me["sev"] and not o["claimed"]]
+        results["priority"] = not better
+        if better:
+            b = opts[better[0]]
+            notes.append(f"a {SEVERITY_NAMES[b['sev']]} victim {b['dist']:.0f} m away was about the same effort "
+                         f"as the {SEVERITY_NAMES[me['sev']]} one you chose ({me['dist']:.0f} m), and nobody "
+                         f"else was going for them")
+
+    # deadline: did they go for someone they could not reach in time, while others were reachable?
+    if me["slack"] < 0 or any(o["slack"] < 0 for o in others.values()):
+        feasible_alt = [k for k, o in others.items() if o["slack"] >= 0 and o["sev"] >= 2]
+        ok = me["slack"] >= 0 or not feasible_alt
+        results["deadline"] = ok
+        if not ok:
+            notes.append(f"that victim had {me['time_left']:.0f} s left but was {me['dist']:.0f} m away - "
+                         f"too far to reach in time")
+
+    # coordination: was a blue robot already heading there, and closer?
+    if any(o["claimed"] for o in opts.values()) and any(not o["claimed"] for o in others.values()):
+        dup = me["claimed"] and me["mate_dist"] < me["dist"]
+        results["coordination"] = not dup
+        if dup:
+            notes.append(f"a blue robot was already on its way there and was closer ({me['mate_dist']:.0f} m)")
+
+    # trade-off (discounting): near low-severity vs far high-severity, by discounted value
+    # (victims a blue robot is already heading for don't count: they are being taken care of)
+    free_opts = {k: o for k, o in opts.items() if k == j or not o["claimed"]}
+    nearest = min(free_opts, key=lambda k: free_opts[k]["dist"])
+    far_better = [k for k, o in free_opts.items()
+                  if o["sev"] > free_opts[nearest]["sev"] and o["dist"] > free_opts[nearest]["dist"] + 8]
+    if far_better:
+        value = {k: o["sev"] * GAMMA_PER_S ** (o["dist"] / SPEED) for k, o in free_opts.items() if o["slack"] >= 0}
+        if value:
+            best_v = max(value, key=value.get)
+            ok = value.get(j, 0.0) >= 0.85 * value[best_v]
+            results["trade_off"] = ok
+            if not ok:
+                b = opts[best_v]
+                notes.append(f"counting travel time, the {SEVERITY_NAMES[b['sev']]} victim {b['dist']:.0f} m away was "
+                             f"worth more ({b['sev']} x 0.95^{b['dist'] / SPEED:.0f}s = {value[best_v]:.2f}) than "
+                             f"yours ({me['sev']} x 0.95^{me['dist'] / SPEED:.0f}s = {value.get(j, 0.0):.2f})")
+
+    # adaptation and overall quality are judged against the trained agent's choice
+    quality = None
+    if probs is not None:
+        best = int(np.argmax(probs[:WAIT]))
+        quality = min(float(probs[j] / max(probs[best], 1e-9)), 1.0)
+        if since_report <= NEW_REPORT_S and any(o["new"] and o["sev"] >= 2 for o in opts.values()):
+            results["adaptation"] = quality >= 0.5
+    return results, notes, quality
+
+
 class LearnerModel:
     def __init__(self, env, ctrl, expert=None, learner=0):
         self.env, self.ctrl, self.expert, self.me = env, ctrl, expert, learner
@@ -76,25 +159,12 @@ class LearnerModel:
             self._snapshot(reason="tick")
 
     def _snapshot(self, reason):
-        env, ctrl = self.env, self.ctrl
+        env = self.env
         if env.carrying[self.me] >= 0:
             return
-        pos = env.robot_positions()[self.me]
-        V, _, mask = actor_features(env, ctrl, self.me, mask_infeasible=False)
-        options = {}
-        for j in range(N_VICTIMS):
-            if env.status[j] != WAITING or not mask[j]:
-                continue
-            claimed_by = [k for k in (1, 2) if ctrl.target[k] == j]
-            mate_d = min([path_dist(ctrl.planner, env.robot_positions()[k], env.victim_pos[j]) for k in claimed_by],
-                         default=np.inf)
-            options[j] = dict(sev=int(env.severity[j]), dist=float(V[j, 5] * 40.0),
-                              time_left=float(env.time_left[j] * DT) if env.severity[j] > 1 else None,
-                              slack=float(V[j, 7]), claimed=bool(claimed_by), mate_dist=float(mate_d),
-                              new=bool(V[j, 11] > 0))
-        probs = self.expert.probs(self.me) if self.expert is not None else None
-        self.snapshots.append(dict(t=env.t, reason=reason, pos=pos.copy(), options=options, probs=probs,
-                                   since_report=(env.t - self.last_report_t) * DT))
+        snap = situation(env, self.ctrl, self.me, self.expert, self.last_report_t)
+        snap["reason"] = reason
+        self.snapshots.append(snap)
         self.snapshots = self.snapshots[-int(SNAPSHOT_KEEP / (SNAPSHOT_EVERY * DT)):]
 
     # ------------------------------------------------------------------ assessment
@@ -123,68 +193,13 @@ class LearnerModel:
         snap = self._commit_snapshot(j)
         if snap is None or len(snap["options"]) < 2:
             return                                         # no real choice was made
-        opts, me = snap["options"], snap["options"][j]
-        others = {k: o for k, o in opts.items() if k != j}
-        results, notes = {}, []
-
-        # priority: was a clearly more severe victim available for similar effort?
-        fair = {k: o for k, o in others.items() if o["dist"] <= me["dist"] + COMPARABLE_EXTRA_M and o["slack"] >= 0}
-        if any(o["sev"] != me["sev"] for o in fair.values()):
-            better = [k for k, o in fair.items() if o["sev"] > me["sev"] and not o["claimed"]]
-            results["priority"] = not better
-            if better:
-                b = opts[better[0]]
-                notes.append(f"a {SEVERITY_NAMES[b['sev']]} victim {b['dist']:.0f} m away was about the same effort "
-                             f"as the {SEVERITY_NAMES[me['sev']]} one you chose ({me['dist']:.0f} m), and nobody "
-                             f"else was going for them")
-
-        # deadline: did they go for someone they could not reach in time, while others were reachable?
-        if me["slack"] < 0 or any(o["slack"] < 0 for o in others.values()):
-            feasible_alt = [k for k, o in others.items() if o["slack"] >= 0 and o["sev"] >= 2]
-            ok = me["slack"] >= 0 or not feasible_alt
-            results["deadline"] = ok
-            if not ok:
-                notes.append(f"that victim had {me['time_left']:.0f} s left but was {me['dist']:.0f} m away - "
-                             f"too far to reach in time")
-
-        # coordination: was a blue robot already heading there, and closer?
-        if any(o["claimed"] for o in opts.values()) and any(not o["claimed"] for o in others.values()):
-            dup = me["claimed"] and me["mate_dist"] < me["dist"]
-            results["coordination"] = not dup
-            if dup:
-                notes.append(f"a blue robot was already on its way there and was closer ({me['mate_dist']:.0f} m)")
-
-        # trade-off (discounting): near low-severity vs far high-severity, by discounted value
-        # (victims a blue robot is already heading for don't count: they are being taken care of)
-        free_opts = {k: o for k, o in opts.items() if k == j or not o["claimed"]}
-        nearest = min(free_opts, key=lambda k: free_opts[k]["dist"])
-        far_better = [k for k, o in free_opts.items()
-                      if o["sev"] > free_opts[nearest]["sev"] and o["dist"] > free_opts[nearest]["dist"] + 8]
-        if far_better:
-            value = {k: o["sev"] * GAMMA_PER_S ** (o["dist"] / SPEED) for k, o in free_opts.items() if o["slack"] >= 0}
-            if value:
-                best_v = max(value, key=value.get)
-                ok = value.get(j, 0.0) >= 0.85 * value[best_v]
-                results["trade_off"] = ok
-                if not ok:
-                    b = opts[best_v]
-                    notes.append(f"counting travel time, the {SEVERITY_NAMES[b['sev']]} victim {b['dist']:.0f} m away was "
-                                 f"worth more ({b['sev']} x 0.95^{b['dist'] / SPEED:.0f}s = {value[best_v]:.2f}) than "
-                                 f"yours ({me['sev']} x 0.95^{me['dist'] / SPEED:.0f}s = {value.get(j, 0.0):.2f})")
-
-        # adaptation and overall quality are judged against the trained agent's choice
-        if snap["probs"] is not None:
-            p = snap["probs"]
-            best = int(np.argmax(p[:WAIT]))
-            q = float(p[j] / max(p[best], 1e-9))
-            self.quality.append(min(q, 1.0))
-            if snap["since_report"] <= NEW_REPORT_S and any(o["new"] and o["sev"] >= 2 for o in opts.values()):
-                results["adaptation"] = q >= 0.5
-
+        results, notes, quality = judge_choice(snap["options"], j, snap["probs"], snap["since_report"])
+        if quality is not None:
+            self.quality.append(quality)
         for c, ok in results.items():
             self._bkt(c, ok)
         self.decisions.append(dict(t=self.env.t, victim=j, commit_t=snap["t"], results=results, notes=notes,
-                                   quality=self.quality[-1] if snap["probs"] is not None else None))
+                                   quality=quality))
 
     def _bkt(self, concept, correct):
         pL = self.mastery[concept]

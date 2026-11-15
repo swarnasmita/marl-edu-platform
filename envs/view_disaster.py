@@ -14,11 +14,15 @@ playing, it estimates how well you understand five RL ideas (Bayesian
 Knowledge Tracing) and explains each decision it judged. It persists across
 restarts (R); press K to start a fresh learner profile.
 
+Robot tutor (pedagogical agent, learner/checkpoints/tutor.pt): at your decisions the blue robots may give a
+hint, ask a question (the game pauses - press Space to continue) or explain your last choice - or stay quiet.
+It was trained with RL to help when it pays off and not to interrupt too much. Press T to switch it off/on.
+
 Mouse (free camera): left-drag = rotate, right-drag = pan, wheel = zoom.
 Keys: arrows = move, C = next camera, F = free camera follows your robot,
       H = hide/show highlights, L = show your robot's distance sensors,
       M = switch blue robots between MAPPO and the greedy rule, R = restart,
-      K = reset your learner profile.
+      K = reset your learner profile, T = robot tutor on/off, Space = continue after a question.
 Run from the project root:  python envs/view_disaster.py
 """
 import os
@@ -35,6 +39,7 @@ from PySide6.QtWidgets import QApplication, QHBoxLayout, QLabel, QVBoxLayout, QW
 from agents.heuristic_policy import direction_to_action
 from agents.hrl import WAIT, HierarchicalController, MappoChooser, greedy_choice
 from learner.learner_model import CONCEPTS, LearnerModel
+from learner.live_tutor import TUTOR, LiveTutor
 from envs.disaster_env import (CAMERAS, CARRIED, DT, LEARNER, LOST, MAX_STEPS, N_ROBOTS, N_VICTIMS,
                                R_RESCUE, RAY_ANGLES, RAY_RANGE, SAFE_CENTER, SEVERITY_COLOURS,
                                SEVERITY_NAMES, UNREPORTED, URGENT_STEPS, WAITING, DisasterResponseEnv)
@@ -107,7 +112,7 @@ class LearnerPanel(QWidget):
         y += 52
         p.setPen(QColor(240, 240, 240))
         p.setFont(QFont("Segoe UI", 10, QFont.Bold))
-        p.drawText(QRectF(16, y, PANEL_W - 32, 20), Qt.AlignLeft, "Your last decision")
+        p.drawText(QRectF(16, y, PANEL_W - 32, 20), Qt.AlignLeft, "Robot tutor / your last decision")
         p.setFont(QFont("Segoe UI", 9))
         p.setPen(QColor(215, 215, 220))
         text = self.feedback or "Pick up a victim: your choice will be explained here."
@@ -127,6 +132,11 @@ class Viewer(QWidget):
         self.mappo = MappoChooser(self.env, self.ctrl, CHECKPOINT) if os.path.exists(CHECKPOINT) else None
         self.brain = "mappo" if self.mappo else "greedy"
         self.learner = LearnerModel(self.env, self.ctrl, expert=self.mappo)
+        self.tutor = LiveTutor(self.env, self.ctrl, self.learner, self.mappo) \
+            if (self.mappo is not None and os.path.exists(TUTOR)) else None
+        self.tutor_on = self.tutor is not None
+        self.speech = None             # (speaker, kind, text, until step) shown as a speech bubble
+        self.paused = False
         self.panel = LearnerPanel()
         self.feedback = None
         self.pressed = set()
@@ -160,6 +170,9 @@ class Viewer(QWidget):
         self.env.reset()
         self.ctrl.reset()
         self.learner.new_episode()
+        if self.tutor is not None:
+            self.tutor.new_episode()
+        self.speech, self.paused = None, False
         self.draw()
 
     # --- keyboard -------------------------------------------------------------------
@@ -182,8 +195,22 @@ class Viewer(QWidget):
         elif k == Qt.Key_L:
             self.show_rays = not self.show_rays
             self.draw()
+        elif k == Qt.Key_Space and self.paused:
+            self.paused, self.speech = False, None
+            self.message = "Back to the rescue."
+        elif k == Qt.Key_T:
+            if self.tutor is None:
+                self.message = "No trained tutor found (learner/checkpoints/tutor.pt)."
+            else:
+                self.tutor_on = not self.tutor_on
+                self.speech, self.paused = None, False
+                self.message = "Robot tutor " + ("on: the blue robots may give hints, ask or explain."
+                                                 if self.tutor_on else "off.")
+            self.draw()
         elif k == Qt.Key_K:
             self.learner.reset()
+            if self.tutor is not None:
+                self.tutor.reset()
             self.feedback = None
             self.message = "Started a fresh learner profile."
             self.draw()
@@ -249,15 +276,27 @@ class Viewer(QWidget):
         return greedy_choice(self.env, self.ctrl, i)
 
     def tick(self):
-        if not self.env.agents:          # episode over: wait for R
+        if not self.env.agents or self.paused:          # episode over (wait for R) / question (wait for Space)
             return
         actions = self.ctrl.actions(self.choose, teammate=None, learner_action=self.learner_action())
         _, _, _, _, infos = self.env.step(actions)
         self.ctrl.notify(infos[LEARNER]["events"])
         n_before = len(self.learner.decisions)
         self.learner.observe(infos[LEARNER]["events"])
-        if len(self.learner.decisions) > n_before:
+        if self.tutor_on:
+            # the tutor decides whether to say anything; the panel shows only what it chose to say
+            said = self.tutor.on_step(infos[LEARNER]["events"])
+            if said is not None:
+                speaker, kind, text = said
+                self.speech = (speaker, kind, text, self.env.t + 240)
+                self.feedback = f"{speaker}: {text}"
+                if kind == "ask":
+                    self.paused = True
+                    self.message = f"{speaker} asks you something - think about it, then press Space to continue."
+        elif len(self.learner.decisions) > n_before:
             self.feedback = self.learner.last_feedback()
+        if self.speech is not None and not self.paused and self.env.t > self.speech[3]:
+            self.speech = None
 
         for kind, robot, victim in infos[LEARNER]["events"]:
             self.message = self.describe(kind, robot, victim)
@@ -300,7 +339,7 @@ class Viewer(QWidget):
             f"Camera: {CAMERA_LABELS[env.camera]}   |   Blue robots: {self.brain_name()} (M)\n"
             f"{self.message}\n"
             f"Arrows move  ·  C camera  ·  F follow  ·  mouse rotate/pan/zoom  ·  H highlights  ·  "
-            f"L sensors  ·  R restart"
+            f"L sensors  ·  R restart  ·  T robot tutor ({'on' if self.tutor_on else 'off'})"
         )
 
     def label(self, p, x, y, text, colour):
@@ -416,7 +455,39 @@ class Viewer(QWidget):
             elif i > 0 and self.ctrl.target[i] is None and env.status[env.status == WAITING].size:
                 name += " (waiting)"
             self.label(p, x, y, name, col)
+
+        # what the tutor (a blue robot) is saying
+        if self.speech is not None:
+            speaker, kind, text, _ = self.speech
+            i = 1 if speaker == "R1" else 2
+            x, y = pts[i]
+            if not (np.isfinite(x) and 0 <= x < W and 0 <= y < H):
+                x, y = W / 2, 120
+            self.bubble(p, x, y - 26, speaker, kind, text)
         p.end()
+
+    def bubble(self, p, x, y, speaker, kind, text):
+        """Speech bubble above a robot (kept on screen)."""
+        bw = 380
+        p.setFont(QFont("Segoe UI", 9))
+        body = p.fontMetrics().boundingRect(0, 0, bw - 20, 400, Qt.TextWordWrap, text)
+        bh = body.height() + 34 + (16 if kind == "ask" else 0)
+        bx = float(np.clip(x - bw / 2, 8, W - bw - 8))
+        by = float(np.clip(y - bh, 8, H - bh - 8))
+        p.setPen(QPen(QColor(40, 130, 245), 2))
+        p.setBrush(QColor(250, 252, 255, 240))
+        p.drawRoundedRect(QRectF(bx, by, bw, bh), 8, 8)
+        title = {"hint": "hint", "ask": "question", "explain": "about your last choice"}[kind]
+        p.setPen(QColor(25, 90, 190))
+        p.setFont(QFont("Segoe UI", 9, QFont.Bold))
+        p.drawText(QRectF(bx + 10, by + 6, bw - 20, 18), Qt.AlignLeft, f"{speaker} ({title})")
+        p.setPen(QColor(30, 30, 35))
+        p.setFont(QFont("Segoe UI", 9))
+        p.drawText(QRectF(bx + 10, by + 26, bw - 20, body.height() + 4), Qt.TextWordWrap, text)
+        if kind == "ask":
+            p.setPen(QColor(120, 120, 130))
+            p.setFont(QFont("Segoe UI", 8))
+            p.drawText(QRectF(bx + 10, by + bh - 20, bw - 20, 16), Qt.AlignLeft, "Game paused - press Space to continue")
 
 
 if __name__ == "__main__":
