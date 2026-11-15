@@ -139,11 +139,16 @@ def path_dist(planner, frm, to):
     return float(planner.field(to)[c])
 
 
+ABLATION = set()      # ablation study: "no_mask" (no deadline masking), "no_intent" (no human-intent input)
+
+
 def actor_features(env, ctrl, i, mask_infeasible=True):
     """What robot i knows when deciding: per-victim features, global features and the action mask.
 
     mask_infeasible: when at least one victim can still be reached in time, victims whose deadline can no
     longer be met are not offered (fix 1). The learner model and the rule baselines pass False."""
+    if "no_mask" in ABLATION:
+        mask_infeasible = False
     plan = ctrl.planner
     pos = env.robot_positions()
     V = np.zeros((N_VICTIMS, ACTOR_VICTIM_DIM), np.float32)
@@ -172,7 +177,7 @@ def actor_features(env, ctrl, i, mask_infeasible=True):
                 d_vt / DIST_SCALE, np.clip(slack, -1, 1), float(any(ctrl.target[k] == j for k in mates)),
                 min(nearest_other, 2 * DIST_SCALE) / DIST_SCALE, float(ctrl.target[i] == j),
                 float(env.t - ctrl.reported_at.get(j, -10 ** 6) < NEW_STEPS),
-                float(i != 0 and ctrl.human_intent == j)]          # fix 3: the human seems to be heading here
+                float(i != 0 and ctrl.human_intent == j and "no_intent" not in ABLATION)]   # fix 3: human heading here
     V = np.nan_to_num(V, posinf=2.0, neginf=-2.0)
     if mask_infeasible:
         feasible = mask[:WAIT] & (V[:, 7] >= 0)
@@ -199,7 +204,7 @@ def critic_features(env, ctrl, i, teammate):
         V[j] = [1.0, sev == 3, sev == 2, sev == 1, min(env.time_left[j] * DT / TIME_SCALE, 1.0), *d,
                 ctrl.dist_to_triage(env.victim_pos[j]) / DIST_SCALE, float(ctrl.target[1] == j),
                 float(ctrl.target[2] == j), float(env.t - ctrl.reported_at.get(j, -10 ** 6) < NEW_STEPS),
-                float(i == 1), float(ctrl.human_intent == j)]
+                float(i == 1), float(ctrl.human_intent == j and "no_intent" not in ABLATION)]
     V = np.nan_to_num(V, posinf=2.0, neginf=-2.0)
     tm = [float(teammate == t) for t in TEAMMATE_TYPES]
     G = np.array([1 - env.t / MAX_STEPS, np.sum(env.status == UNREPORTED) / 4,

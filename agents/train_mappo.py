@@ -66,7 +66,10 @@ def _episode(args):
     """Run one episode. mode = 'train' (sample actions, record transitions) or a rule/eval mode."""
     actor_state, critic_state, seed, teammate, mode, *rest = args
     algo = rest[0] if rest else "mappo"
+    ablation = set(rest[1]) if len(rest) > 1 else set()
     import agents.hrl as H
+    H.ABLATION.clear()
+    H.ABLATION.update(ablation)
     from envs.disaster_env import N_VICTIMS, RESCUED
     torch, env, ctrl = _W["torch"], _W["env"], _W["ctrl"]
     actor = _W["actor"]
@@ -104,7 +107,8 @@ def _episode(args):
             pending[i]["next_value"] = value
             trajs[i].append(pending[i])
         other = [k for k in H.RL_ROBOTS if k != i][0]
-        penalty = DUP_PENALTY * REWARD_SCALE if (a != H.WAIT and ctrl.target[other] == a) else 0.0
+        penalty = DUP_PENALTY * REWARD_SCALE if (a != H.WAIT and ctrl.target[other] == a
+                                                 and "no_dup_penalty" not in ablation) else 0.0
         pending[i] = dict(V=V, G=G, mask=mask, Vc=Vc, Gc=Gc, a=a, logp=float(dist.log_prob(torch.tensor(a))),
                           value=value, R=-penalty, disc=1.0, next_value=0.0, done=0.0)
         return a
@@ -201,10 +205,10 @@ def ppo_update(actor, critic, opt, batch, args, ent_coef):
     return np.mean(stats, axis=0)
 
 
-def evaluate(pool, actor, critic, seeds, mode="eval"):
+def evaluate(pool, actor, critic, seeds, mode="eval", ablation=()):
     a_state = {k: v.clone() for k, v in actor.state_dict().items()} if actor is not None else None
     c_state = {k: v.clone() for k, v in critic.state_dict().items()} if critic is not None else None
-    jobs = [(a_state, c_state, s, tm, mode) for s in seeds for tm in ("greedy", "idle")]
+    jobs = [(a_state, c_state, s, tm, mode, "mappo", tuple(ablation)) for s in seeds for tm in ("greedy", "idle")]
     res = pool.map(_episode, jobs)
     out = {}
     for tm in ("greedy", "idle"):
@@ -247,6 +251,8 @@ def plot(log_path, baselines, out_png, name="MAPPO"):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--algo", choices=("mappo", "ippo", "maa2c"), default="mappo")
+    p.add_argument("--ablation", nargs="*", default=[], choices=("no_mask", "no_dup_penalty", "no_intent"),
+                   help="ablation study: switch off deadline masking / the duplicate penalty / the human-intent input")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out", default=None, help="default: runs/<algo>_seed<seed>")
     p.add_argument("--iterations", type=int, default=150)
@@ -262,7 +268,7 @@ def main():
     if args.epochs is None:
         args.epochs = 1 if args.algo == "maa2c" else 4
     if args.out is None:
-        args.out = f"runs/{args.algo}_seed{args.seed}"
+        args.out = f"runs/{args.algo}{''.join('_' + a for a in args.ablation)}_seed{args.seed}"
     val_seeds = VAL_SEEDS[:args.val_scenarios]
 
     import torch
@@ -295,7 +301,7 @@ def main():
             a_state = {k: v.clone() for k, v in actor.state_dict().items()}
             c_state = {k: v.clone() for k, v in critic.state_dict().items()}
             jobs = [(a_state, c_state, args.seed * 1_000_000 + episodes + k, str(rng.choice(kinds, p=probs)), "train",
-                     args.algo)
+                     args.algo, tuple(args.ablation))
                     for k in range(args.episodes_per_iter)]
             results = pool.map(_episode, jobs)
             episodes += len(jobs)
@@ -307,21 +313,22 @@ def main():
                        train_sev=np.mean([r["sev"] for r, _ in results]), pg_loss=pg, v_loss=vl, entropy=ent,
                        val_greedy="", val_idle="", val_sev_greedy="", minutes=(time.time() - t0) / 60)
             if it % args.eval_every == 0 or it == args.iterations:
-                v = evaluate(pool, actor, critic, val_seeds)
+                v = evaluate(pool, actor, critic, val_seeds, ablation=args.ablation)
                 row.update(val_greedy=v["greedy"]["score"], val_idle=v["idle"]["score"],
                            val_sev_greedy=v["greedy"]["sev"])
                 mean_val = (v["greedy"]["score"] + v["idle"]["score"]) / 2
                 if mean_val > best:
                     best = mean_val
-                    torch.save({"version": H_VERSION, "algo": args.algo, "actor": actor.state_dict(), "critic": critic.state_dict(), "iteration": it,
+                    torch.save({"version": H_VERSION, "algo": args.algo, "ablation": list(args.ablation), "actor": actor.state_dict(),
+                            "critic": critic.state_dict(), "iteration": it,
                                 "episodes": episodes, "val": v}, os.path.join(args.out, "best.pt"))
                 print(f"it {it:4d} | ep {episodes:5d} | train {row['train_score']:6.1f} | val greedy-mate "
                       f"{v['greedy']['score']:6.1f} idle-mate {v['idle']['score']:6.1f} | ent {ent:.2f} | "
                       f"{row['minutes']:.1f} min", flush=True)
             with open(log_path, "a", newline="") as f:
                 csv.DictWriter(f, fields).writerow(row)
-        torch.save({"version": H_VERSION, "algo": args.algo, "actor": actor.state_dict(), "critic": critic.state_dict(),
-                    "iteration": args.iterations,
+        torch.save({"version": H_VERSION, "algo": args.algo, "ablation": list(args.ablation), "actor": actor.state_dict(),
+                    "critic": critic.state_dict(), "iteration": args.iterations,
                     "episodes": episodes}, os.path.join(args.out, "last.pt"))
     plot(log_path, baselines, os.path.join(args.out, "learning_curve.png"), name=args.algo.upper())
     print("done; best validation (mean of both teammates):", round(best, 1), "->", os.path.join(args.out, "best.pt"))

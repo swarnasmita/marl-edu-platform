@@ -32,11 +32,13 @@ LABELS = {"random": "Random target", "greedy": "Greedy rule (severity / distance
 
 def run_policy(pool, mode, ckpt=None):
     a_state = c_state = None
+    ablation = ()
     if ckpt is not None:
         import torch
-        state = torch.load(ckpt, map_location="cpu")
+        state = torch.load(ckpt, map_location="cpu", weights_only=False)
         a_state, c_state = state["actor"], None      # only the actor (or Q-network) is needed to act
-    jobs = [(a_state, c_state, s, tm, mode) for tm in TEAMMATES for s in TEST_SEEDS]
+        ablation = tuple(state.get("ablation", ()))  # ablation study: test with the same switches as in training
+    jobs = [(a_state, c_state, s, tm, mode, "mappo", ablation) for tm in TEAMMATES for s in TEST_SEEDS]
     res = pool.map(_episode, jobs, chunksize=4)
     return [(j[3], j[2], r[0]) for j, r in zip(jobs, res)]
 
